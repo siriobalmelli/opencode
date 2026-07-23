@@ -379,6 +379,7 @@ const promptOps = {
   cancel: () => Effect.void,
   resolvePromptParts: () => Effect.succeed([]),
   prompt: () => Effect.die("unused prompt operation"),
+  loop: () => Effect.die("unused loop operation"),
 }
 
 function streamInput(parent: SessionV1.User, chatID: SessionID, model: Provider.Model, text: string) {

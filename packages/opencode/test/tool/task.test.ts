@@ -73,7 +73,7 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
     id: MessageID.ascending(),
     role: "user",
     sessionID: chat.id,
-    agent: "build",
+    agent: "implementer",
     model: ref,
     time: { created: Date.now() },
   })
@@ -82,8 +82,8 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
     role: "assistant",
     parentID: user.id,
     sessionID: chat.id,
-    mode: "build",
-    agent: "build",
+    mode: "implementer",
+    agent: "implementer",
     cost: 0,
     path: { cwd: "/tmp", root: "/tmp" },
     tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
@@ -97,14 +97,40 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
 })
 
 function stubOps(opts?: { onPrompt?: (input: SessionPrompt.PromptInput) => void; text?: string }): TaskPromptOps {
+  let notification: SessionV1.WithParts | undefined
   return {
     cancel: () => Effect.void,
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
     prompt: (input) =>
       Effect.sync(() => {
         opts?.onPrompt?.(input)
+        if (input.noReply) {
+          notification = admit(input)
+          return notification
+        }
         return reply(input, opts?.text ?? "done")
       }),
+    loop: (input) =>
+      Effect.succeed(reply({ sessionID: input.sessionID, messageID: notification?.info.id, parts: [] }, "resumed")),
+  }
+}
+
+function admit(input: SessionPrompt.PromptInput): SessionV1.WithParts {
+  const id = input.messageID ?? MessageID.ascending()
+  return {
+    info: {
+      id,
+      role: "user",
+      sessionID: input.sessionID,
+      time: { created: Date.now() },
+      agent: input.agent ?? "implementer",
+      model: {
+        providerID: input.model?.providerID ?? ref.providerID,
+        modelID: input.model?.modelID ?? ref.modelID,
+        variant: input.variant,
+      },
+    },
+    parts: [],
   }
 }
 
@@ -116,8 +142,8 @@ function reply(input: SessionPrompt.PromptInput, text: string): SessionV1.WithPa
       role: "assistant",
       parentID: input.messageID ?? MessageID.ascending(),
       sessionID: input.sessionID,
-      mode: input.agent ?? "general",
-      agent: input.agent ?? "general",
+      mode: input.agent ?? "implementer",
+      agent: input.agent ?? "implementer",
       cost: 0,
       path: { cwd: "/tmp", root: "/tmp" },
       tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
@@ -144,7 +170,7 @@ describe("tool.task", () => {
     () =>
       Effect.gen(function* () {
         const agent = yield* Agent.Service
-        const build = yield* agent.get("build")
+        const build = yield* agent.get("caller")
         const registry = yield* ToolRegistry.Service
         const get = Effect.fnUntraced(function* () {
           const tools = yield* registry.tools({ ...ref, agent: build })
@@ -156,18 +182,18 @@ describe("tool.task", () => {
         expect(first).toBe(second)
 
         const alpha = first.indexOf("- alpha: Alpha agent")
-        const explore = first.indexOf("- explore:")
-        const general = first.indexOf("- general:")
         const zebra = first.indexOf("- zebra: Zebra agent")
 
         expect(alpha).toBeGreaterThan(-1)
-        expect(explore).toBeGreaterThan(alpha)
-        expect(general).toBeGreaterThan(explore)
-        expect(zebra).toBeGreaterThan(general)
+        expect(zebra).toBeGreaterThan(alpha)
       }),
     {
       config: {
         agent: {
+          caller: {
+            mode: "primary",
+            permission: { task: "allow" },
+          },
           zebra: {
             description: "Zebra agent",
             mode: "subagent",
@@ -186,7 +212,7 @@ describe("tool.task", () => {
     () =>
       Effect.gen(function* () {
         const agent = yield* Agent.Service
-        const build = yield* agent.get("build")
+        const build = yield* agent.get("caller")
         const registry = yield* ToolRegistry.Service
         const description =
           (yield* registry.tools({ ...ref, agent: build })).find((tool) => tool.id === TaskTool.id)?.description ?? ""
@@ -196,13 +222,11 @@ describe("tool.task", () => {
       }),
     {
       config: {
-        permission: {
-          task: {
-            "*": "allow",
-            zebra: "deny",
-          },
-        },
         agent: {
+          caller: {
+            mode: "primary",
+            permission: { task: { "*": "allow", zebra: "deny" } },
+          },
           zebra: {
             description: "Zebra agent",
             mode: "subagent",
@@ -216,43 +240,46 @@ describe("tool.task", () => {
     },
   )
 
-  it.instance("execute resumes an existing task session from task_id", () =>
-    Effect.gen(function* () {
-      const sessions = yield* Session.Service
-      const { chat, assistant } = yield* seed()
-      const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-      let seen: SessionPrompt.PromptInput | undefined
-      const promptOps = stubOps({ text: "resumed", onPrompt: (input) => (seen = input) })
+  it.instance(
+    "execute resumes an existing task session from task_id",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ text: "resumed", onPrompt: (input) => (seen = input) })
 
-      const result = yield* def.execute(
-        {
-          description: "inspect bug",
-          prompt: "look into the cache key path",
-          subagent_type: "general",
-          task_id: child.id,
-        },
-        {
-          sessionID: chat.id,
-          messageID: assistant.id,
-          agent: "build",
-          abort: new AbortController().signal,
-          extra: { promptOps },
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-        },
-      )
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "resumer",
+            task_id: child.id,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "implementer",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
 
-      const kids = yield* sessions.children(chat.id)
-      expect(kids).toHaveLength(1)
-      expect(kids[0]?.id).toBe(child.id)
-      expect(result.metadata.sessionId).toBe(child.id)
-      expect(result.output).toContain(`<task id="${child.id}" state="completed">`)
-      expect(seen?.sessionID).toBe(child.id)
-      expect(seen?.variant).toBe("xhigh")
-    }),
+        const kids = yield* sessions.children(chat.id)
+        expect(kids).toHaveLength(1)
+        expect(kids[0]?.id).toBe(child.id)
+        expect(result.metadata.sessionId).toBe(child.id)
+        expect(result.output).toContain(`<task id="${child.id}" state="completed">`)
+        expect(seen?.sessionID).toBe(child.id)
+        expect(seen?.variant).toBe("xhigh")
+      }),
+    { config: { agent: { resumer: { mode: "subagent" } } } },
   )
 
   it.instance("execute asks by default and skips checks when bypassed", () =>
@@ -268,12 +295,12 @@ describe("tool.task", () => {
           {
             description: "inspect bug",
             prompt: "look into the cache key path",
-            subagent_type: "general",
+            subagent_type: "implementer",
           },
           {
             sessionID: chat.id,
             messageID: assistant.id,
-            agent: "build",
+            agent: "implementer",
             abort: new AbortController().signal,
             extra: { promptOps, ...extra },
             messages: [],
@@ -291,11 +318,11 @@ describe("tool.task", () => {
       expect(calls).toHaveLength(1)
       expect(calls[0]).toEqual({
         permission: "task",
-        patterns: ["general"],
+        patterns: ["implementer"],
         always: ["*"],
         metadata: {
           description: "inspect bug",
-          subagent_type: "general",
+          subagent_type: "implementer",
         },
       })
     }),
@@ -320,6 +347,7 @@ describe("tool.task", () => {
             ready.resolve(input)
             return cancelled.promise
           }).pipe(Effect.as(reply(input, "cancelled"))),
+        loop: (input) => Effect.succeed(reply({ sessionID: input.sessionID, parts: [] }, "resumed")),
       }
 
       const fiber = yield* def
@@ -327,12 +355,12 @@ describe("tool.task", () => {
           {
             description: "inspect bug",
             prompt: "look into the cache key path",
-            subagent_type: "general",
+            subagent_type: "implementer",
           },
           {
             sessionID: chat.id,
             messageID: assistant.id,
-            agent: "build",
+            agent: "implementer",
             abort: abort.signal,
             extra: { promptOps },
             messages: [],
@@ -364,13 +392,13 @@ describe("tool.task", () => {
         {
           description: "inspect bug",
           prompt: "look into the cache key path",
-          subagent_type: "general",
+          subagent_type: "implementer",
           task_id: "ses_missing",
         },
         {
           sessionID: chat.id,
           messageID: assistant.id,
-          agent: "build",
+          agent: "implementer",
           abort: new AbortController().signal,
           extra: { promptOps },
           messages: [],
@@ -405,7 +433,7 @@ describe("tool.task", () => {
             {
               sessionID: chat.id,
               messageID: assistant.id,
-              agent: "build",
+              agent: "implementer",
               abort: new AbortController().signal,
               extra: { promptOps: stubOps({ text: "" }) },
               messages: [],
@@ -450,7 +478,7 @@ describe("tool.task", () => {
             {
               sessionID: chat.id,
               messageID: assistant.id,
-              agent: "build",
+              agent: "implementer",
               abort: new AbortController().signal,
               extra: { promptOps: stubOps({ text: "   \n\t " }) },
               messages: [],
@@ -495,7 +523,7 @@ describe("tool.task", () => {
             {
               sessionID: chat.id,
               messageID: assistant.id,
-              agent: "build",
+              agent: "implementer",
               abort: new AbortController().signal,
               extra: {
                 promptOps: {
@@ -547,12 +575,12 @@ describe("tool.task", () => {
           {
             description: "inspect bug",
             prompt: "look into the cache key path",
-            subagent_type: "general",
+            subagent_type: "implementer",
           },
           {
             sessionID: child.id,
             messageID: nestedAssistant.id,
-            agent: "general",
+            agent: "implementer",
             abort: new AbortController().signal,
             extra: { promptOps: stubOps() },
             messages: [],
@@ -588,12 +616,12 @@ describe("tool.task", () => {
           {
             description: "inspect bug",
             prompt: "look into the cache key path",
-            subagent_type: "general",
+            subagent_type: "implementer",
           },
           {
             sessionID: child.id,
             messageID: nestedAssistant.id,
-            agent: "general",
+            agent: "implementer",
             abort: new AbortController().signal,
             extra: { promptOps: stubOps() },
             messages: [],
@@ -627,7 +655,7 @@ describe("tool.task", () => {
           {
             sessionID: chat.id,
             messageID: assistant.id,
-            agent: "build",
+            agent: "implementer",
             abort: new AbortController().signal,
             extra: { promptOps },
             messages: [],
@@ -640,11 +668,6 @@ describe("tool.task", () => {
         expect(child.parentID).toBe(chat.id)
         expect(child.agent).toBe("reviewer")
         expect(child.permission).toEqual([
-          {
-            permission: "todowrite",
-            pattern: "*",
-            action: "deny",
-          },
           {
             permission: "bash",
             pattern: "*",
@@ -686,13 +709,13 @@ describe("tool.task", () => {
           {
             description: "inspect bug",
             prompt: "look into the cache key path",
-            subagent_type: "general",
+            subagent_type: "implementer",
             background: true,
           },
           {
             sessionID: chat.id,
             messageID: assistant.id,
-            agent: "build",
+            agent: "implementer",
             abort: new AbortController().signal,
             extra: { promptOps: stubOps() },
             messages: [],
@@ -730,6 +753,7 @@ describe("tool.task", () => {
             return reply(input, "background done")
           })
         },
+        loop: (input) => Effect.succeed(reply({ sessionID: input.sessionID, parts: [] }, "resumed")),
       }
 
       const fiber = yield* def
@@ -737,12 +761,12 @@ describe("tool.task", () => {
           {
             description: "inspect bug",
             prompt: "look into the cache key path",
-            subagent_type: "general",
+            subagent_type: "implementer",
           },
           {
             sessionID: chat.id,
             messageID: assistant.id,
-            agent: "build",
+            agent: "implementer",
             abort: new AbortController().signal,
             extra: { promptOps },
             messages: [],
@@ -783,13 +807,13 @@ describe("tool.task", () => {
         {
           description: "inspect bug",
           prompt: "look into the cache key path",
-          subagent_type: "general",
+          subagent_type: "implementer",
           background: true,
         },
         {
           sessionID: chat.id,
           messageID: assistant.id,
-          agent: "build",
+          agent: "implementer",
           abort: new AbortController().signal,
           extra: {
             promptOps: {
@@ -841,7 +865,7 @@ describe("tool.task", () => {
         const context = {
           sessionID: chat.id,
           messageID: assistant.id,
-          agent: "build",
+          agent: "implementer",
           abort: new AbortController().signal,
           extra: { promptOps },
           messages: [],
@@ -904,6 +928,10 @@ describe("tool.task", () => {
         const def = yield* tool.init()
         const parentPrompts: SessionPrompt.PromptInput[] = []
         const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+        const resumed = yield* Deferred.make<SessionPrompt.LoopInput>()
+        let admittedNotification: SessionV1.WithParts | undefined
+        let implicitParentLoops = 0
+        let parentResumes = 0
 
         const result = yield* def.execute(
           {
@@ -915,7 +943,7 @@ describe("tool.task", () => {
           {
             sessionID: chat.id,
             messageID: assistant.id,
-            agent: "build",
+            agent: "implementer",
             abort: new AbortController().signal,
             extra: {
               promptOps: {
@@ -924,12 +952,29 @@ describe("tool.task", () => {
                   if (input.sessionID !== chat.id) return Effect.succeed(reply(input, "background done"))
                   return Effect.sync(() => {
                     parentPrompts.push(input)
+                    if (input.noReply !== true) implicitParentLoops += 1
                     return input
                   }).pipe(
                     Effect.tap((value) => Deferred.succeed(injected, value)),
-                    Effect.map((value) => reply(value, "injected")),
+                    Effect.map((value) => {
+                      admittedNotification = admit(value)
+                      return admittedNotification
+                    }),
                   )
                 },
+                loop: (input) =>
+                  Effect.sync(() => {
+                    parentResumes += 1
+                    return input
+                  }).pipe(
+                    Effect.tap((value) => Deferred.succeed(resumed, value)),
+                    Effect.map((value) =>
+                      reply(
+                        { sessionID: value.sessionID, messageID: admittedNotification?.info.id, parts: [] },
+                        "resumed",
+                      ),
+                    ),
+                  ),
               } satisfies TaskPromptOps,
             },
             messages: [],
@@ -943,7 +988,11 @@ describe("tool.task", () => {
         expect(waited.info?.status).toBe("completed")
         expect(waited.info?.output).toBe("background done")
         const notification = yield* Deferred.await(injected)
+        expect(yield* Deferred.await(resumed)).toEqual({ sessionID: chat.id })
         expect(parentPrompts).toEqual([notification])
+        expect(implicitParentLoops).toBe(0)
+        expect(parentResumes).toBe(1)
+        expect(notification.noReply).toBe(true)
         expect(notification.parts).toEqual([
           {
             type: "text",
@@ -959,15 +1008,17 @@ describe("tool.task", () => {
   )
 
   background.instance(
-    "background empty output fails and injects one non-empty synthetic error",
+    "background completion resumes again when the first parent loop missed the notification",
     () =>
       Effect.gen(function* () {
         const jobs = yield* BackgroundJob.Service
         const { chat, assistant } = yield* seed()
         const tool = yield* TaskTool
         const def = yield* tool.init()
-        const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+        const secondResume = yield* Deferred.make<SessionPrompt.LoopInput>()
+        let notification: SessionV1.WithParts | undefined
         let parentPrompts = 0
+        let parentResumes = 0
 
         const result = yield* def.execute(
           {
@@ -979,21 +1030,36 @@ describe("tool.task", () => {
           {
             sessionID: chat.id,
             messageID: assistant.id,
-            agent: "build",
+            agent: "implementer",
             abort: new AbortController().signal,
             extra: {
               promptOps: {
-                ...stubOps({ text: "   \n\t " }),
+                ...stubOps({ text: "background done" }),
                 prompt: (input) => {
-                  if (input.sessionID !== chat.id) return Effect.succeed(reply(input, "   \n\t "))
+                  if (input.sessionID !== chat.id) return Effect.succeed(reply(input, "background done"))
                   return Effect.sync(() => {
                     parentPrompts += 1
+                    notification = admit(input)
+                    return notification
+                  })
+                },
+                loop: (input) =>
+                  Effect.sync(() => {
+                    parentResumes += 1
                     return input
                   }).pipe(
-                    Effect.tap((value) => Deferred.succeed(injected, value)),
-                    Effect.map((value) => reply(value, "injected")),
-                  )
-                },
+                    Effect.tap((value) => (parentResumes === 2 ? Deferred.succeed(secondResume, value) : Effect.void)),
+                    Effect.map((value) =>
+                      reply(
+                        {
+                          sessionID: value.sessionID,
+                          messageID: parentResumes === 1 ? assistant.id : notification?.info.id,
+                          parts: [],
+                        },
+                        "resumed",
+                      ),
+                    ),
+                  ),
               } satisfies TaskPromptOps,
             },
             messages: [],
@@ -1002,11 +1068,93 @@ describe("tool.task", () => {
           },
         )
 
+        expect((yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })).info?.status).toBe("completed")
+        expect(yield* Deferred.await(secondResume)).toEqual({ sessionID: chat.id })
+        expect(parentPrompts).toBe(1)
+        expect(parentResumes).toBe(2)
+        expect(notification?.info.id).toBeDefined()
+      }),
+    {
+      config: { agent: { reviewer: { mode: "subagent", permission: { task: "allow" } } } },
+    },
+  )
+
+  background.instance(
+    "background empty output fails and injects one non-empty synthetic error",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+        const resumed = yield* Deferred.make<SessionPrompt.LoopInput>()
+        let admittedNotification: SessionV1.WithParts | undefined
+        let parentPrompts = 0
+        let parentLoops = 0
+        let parentResumes = 0
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "reviewer",
+            background: true,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "implementer",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: {
+                ...stubOps({ text: "   \n\t " }),
+                prompt: (input) => {
+                  if (input.sessionID !== chat.id) return Effect.succeed(reply(input, "   \n\t "))
+                  return Effect.sync(() => {
+                    parentPrompts += 1
+                    if (input.noReply !== true) parentLoops += 1
+                    return input
+                  }).pipe(
+                    Effect.tap((value) => Deferred.succeed(injected, value)),
+                    Effect.map((value) => {
+                      admittedNotification = admit(value)
+                      return admittedNotification
+                    }),
+                  )
+                },
+                loop: (input) =>
+                  Effect.sync(() => {
+                    parentResumes += 1
+                    return input
+                  }).pipe(
+                    Effect.tap((value) => Deferred.succeed(resumed, value)),
+                    Effect.map((value) =>
+                      reply(
+                        { sessionID: value.sessionID, messageID: admittedNotification?.info.id, parts: [] },
+                        "resumed",
+                      ),
+                    ),
+                  ),
+              } satisfies TaskPromptOps,
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(result.output).toContain(`state="running"`)
+        expect(result.output).not.toContain(`state="completed"`)
         const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
         expect(waited.info?.status).toBe("error")
         expect(waited.info?.error).toBe("Task completed without a final response")
         const notification = yield* Deferred.await(injected)
+        expect(yield* Deferred.await(resumed)).toEqual({ sessionID: chat.id })
         expect(parentPrompts).toBe(1)
+        expect(parentLoops).toBe(0)
+        expect(parentResumes).toBe(1)
+        expect(notification.noReply).toBe(true)
         expect(notification.parts).toEqual([
           {
             type: "text",
@@ -1047,7 +1195,7 @@ describe("tool.task", () => {
           {
             sessionID: chat.id,
             messageID: assistant.id,
-            agent: "build",
+            agent: "implementer",
             abort: new AbortController().signal,
             extra: {
               promptOps: {
@@ -1114,7 +1262,7 @@ describe("tool.task", () => {
           {
             sessionID: chat.id,
             messageID: assistant.id,
-            agent: "build",
+            agent: "implementer",
             abort: new AbortController().signal,
             extra: {
               promptOps: {
@@ -1163,13 +1311,13 @@ describe("tool.task", () => {
         {
           description: "inspect bug",
           prompt: "look into the cache key path",
-          subagent_type: "general",
+          subagent_type: "implementer",
           background: true,
         },
         {
           sessionID: chat.id,
           messageID: assistant.id,
-          agent: "build",
+          agent: "implementer",
           abort: new AbortController().signal,
           extra: {
             promptOps: {
@@ -1202,13 +1350,13 @@ describe("tool.task", () => {
         {
           description: "inspect bug",
           prompt: "look into the cache key path",
-          subagent_type: "general",
+          subagent_type: "implementer",
           background: true,
         },
         {
           sessionID: chat.id,
           messageID: assistant.id,
-          agent: "build",
+          agent: "implementer",
           abort: new AbortController().signal,
           extra: {
             promptOps: {
@@ -1241,13 +1389,13 @@ describe("tool.task", () => {
         {
           description: "inspect bug",
           prompt: "look into the cache key path",
-          subagent_type: "general",
+          subagent_type: "implementer",
           background: true,
         },
         {
           sessionID: chat.id,
           messageID: assistant.id,
-          agent: "build",
+          agent: "implementer",
           abort: new AbortController().signal,
           extra: {
             promptOps: {
@@ -1289,7 +1437,7 @@ describe("tool.task", () => {
           {
             sessionID: chat.id,
             messageID: assistant.id,
-            agent: "build",
+            agent: "implementer",
             abort: new AbortController().signal,
             extra: {
               promptOps: {

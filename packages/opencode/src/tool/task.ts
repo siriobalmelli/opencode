@@ -19,6 +19,7 @@ export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+  loop(input: SessionPrompt.LoopInput): Effect.Effect<SessionV1.WithParts>
 }
 
 const id = "task"
@@ -221,28 +222,30 @@ export const TaskTool = Tool.define(
         text: string,
       ) {
         const currentParent = yield* sessions.get(ctx.sessionID)
-        yield* ops
-          .prompt({
-            sessionID: ctx.sessionID,
-            agent: currentParent.agent ?? ctx.agent,
-            variant,
-            parts: [
-              {
-                type: "text",
-                synthetic: true,
-                text: renderOutput({
-                  sessionID: nextSession.id,
-                  state,
-                  summary:
-                    state === "completed"
-                      ? `Background task completed: ${params.description}`
-                      : `Background task failed: ${params.description}`,
-                  text,
-                }),
-              },
-            ],
-          })
-          .pipe(Effect.ignore)
+        const notification = yield* ops.prompt({
+          sessionID: ctx.sessionID,
+          agent: currentParent.agent ?? ctx.agent,
+          variant,
+          noReply: true,
+          parts: [
+            {
+              type: "text",
+              synthetic: true,
+              text: renderOutput({
+                sessionID: nextSession.id,
+                state,
+                summary:
+                  state === "completed"
+                    ? `Background task completed: ${params.description}`
+                    : `Background task failed: ${params.description}`,
+                text,
+              }),
+            },
+          ],
+        })
+        const resumed = yield* ops.loop({ sessionID: ctx.sessionID })
+        if (resumed.info.role === "assistant" && resumed.info.parentID === notification.info.id) return
+        yield* ops.loop({ sessionID: ctx.sessionID })
       })
 
       const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (info: BackgroundJob.Info) {
