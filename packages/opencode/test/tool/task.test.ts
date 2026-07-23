@@ -1016,7 +1016,7 @@ describe("tool.task", () => {
         const tool = yield* TaskTool
         const def = yield* tool.init()
         const secondResume = yield* Deferred.make<SessionPrompt.LoopInput>()
-        let notification: SessionV1.WithParts | undefined
+        let admittedNotification: SessionV1.WithParts | undefined
         let parentPrompts = 0
         let parentResumes = 0
 
@@ -1039,8 +1039,8 @@ describe("tool.task", () => {
                   if (input.sessionID !== chat.id) return Effect.succeed(reply(input, "background done"))
                   return Effect.sync(() => {
                     parentPrompts += 1
-                    notification = admit(input)
-                    return notification
+                    admittedNotification = admit(input)
+                    return admittedNotification
                   })
                 },
                 loop: (input) =>
@@ -1053,7 +1053,7 @@ describe("tool.task", () => {
                       reply(
                         {
                           sessionID: value.sessionID,
-                          messageID: parentResumes === 1 ? assistant.id : notification?.info.id,
+                          messageID: parentResumes === 1 ? assistant.id : admittedNotification?.info.id,
                           parts: [],
                         },
                         "resumed",
@@ -1072,7 +1072,82 @@ describe("tool.task", () => {
         expect(yield* Deferred.await(secondResume)).toEqual({ sessionID: chat.id })
         expect(parentPrompts).toBe(1)
         expect(parentResumes).toBe(2)
-        expect(notification?.info.id).toBeDefined()
+        expect(admittedNotification?.info.id).toBeDefined()
+      }),
+    {
+      config: { agent: { reviewer: { mode: "subagent", permission: { task: "allow" } } } },
+    },
+  )
+
+  background.instance(
+    "background completion retries a failed parent loop",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const secondResume = yield* Deferred.make<SessionPrompt.LoopInput>()
+        let notification: SessionV1.WithParts | undefined
+        let notificationInput: SessionPrompt.PromptInput | undefined
+        let parentPrompts = 0
+        let parentResumes = 0
+        let resumedParentID: SessionV1.Assistant["parentID"] | undefined
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "reviewer",
+            background: true,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "implementer",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: {
+                ...stubOps({ text: "background done" }),
+                prompt: (input) => {
+                  if (input.sessionID !== chat.id) return Effect.succeed(reply(input, "background done"))
+                  return Effect.sync(() => {
+                    parentPrompts += 1
+                    notificationInput = input
+                    notification = admit(input)
+                    return notification
+                  })
+                },
+                loop: (input) =>
+                  Effect.suspend(() => {
+                    parentResumes += 1
+                    if (parentResumes === 1) return Effect.die(new Error("old parent loop failed"))
+                    return Deferred.succeed(secondResume, input).pipe(
+                      Effect.map(() => {
+                        const result = reply(
+                          { sessionID: input.sessionID, messageID: notification?.info.id, parts: [] },
+                          "resumed",
+                        )
+                        resumedParentID = result.info.role === "assistant" ? result.info.parentID : undefined
+                        return result
+                      }),
+                    )
+                  }),
+              } satisfies TaskPromptOps,
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect((yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })).info?.status).toBe("completed")
+        expect(yield* Deferred.await(secondResume)).toEqual({ sessionID: chat.id })
+        expect(parentPrompts).toBe(1)
+        expect(parentResumes).toBe(2)
+        expect(notificationInput?.noReply).toBe(true)
+        expect(notification?.info.role).toBe("user")
+        expect(resumedParentID).toBe(notification?.info.id)
       }),
     {
       config: { agent: { reviewer: { mode: "subagent", permission: { task: "allow" } } } },
@@ -1093,6 +1168,7 @@ describe("tool.task", () => {
         let parentPrompts = 0
         let parentLoops = 0
         let parentResumes = 0
+        let resumedParentID: SessionV1.Assistant["parentID"] | undefined
 
         const result = yield* def.execute(
           {
@@ -1129,12 +1205,14 @@ describe("tool.task", () => {
                     return input
                   }).pipe(
                     Effect.tap((value) => Deferred.succeed(resumed, value)),
-                    Effect.map((value) =>
-                      reply(
+                    Effect.map((value) => {
+                      const result = reply(
                         { sessionID: value.sessionID, messageID: admittedNotification?.info.id, parts: [] },
                         "resumed",
-                      ),
-                    ),
+                      )
+                      resumedParentID = result.info.role === "assistant" ? result.info.parentID : undefined
+                      return result
+                    }),
                   ),
               } satisfies TaskPromptOps,
             },
@@ -1155,6 +1233,7 @@ describe("tool.task", () => {
         expect(parentLoops).toBe(0)
         expect(parentResumes).toBe(1)
         expect(notification.noReply).toBe(true)
+        expect(resumedParentID).toBe(admittedNotification?.info.id)
         expect(notification.parts).toEqual([
           {
             type: "text",
@@ -1183,7 +1262,11 @@ describe("tool.task", () => {
         const def = yield* tool.init()
         const childDone = yield* Deferred.make<void>()
         const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+        const resumed = yield* Deferred.make<SessionPrompt.LoopInput>()
+        let admittedNotification: SessionV1.WithParts | undefined
         let parentPrompts = 0
+        let parentResumes = 0
+        let resumedParentID: SessionV1.Assistant["parentID"] | undefined
 
         const result = yield* def.execute(
           {
@@ -1209,9 +1292,27 @@ describe("tool.task", () => {
                     return input
                   }).pipe(
                     Effect.tap((value) => Deferred.succeed(injected, value)),
-                    Effect.map((value) => reply(value, "injected")),
+                    Effect.map((value) => {
+                      admittedNotification = admit(value)
+                      return admittedNotification
+                    }),
                   )
                 },
+                loop: (input) =>
+                  Effect.sync(() => {
+                    parentResumes += 1
+                    return input
+                  }).pipe(
+                    Effect.tap((value) => Deferred.succeed(resumed, value)),
+                    Effect.map((value) => {
+                      const result = reply(
+                        { sessionID: value.sessionID, messageID: admittedNotification?.info.id, parts: [] },
+                        "resumed",
+                      )
+                      resumedParentID = result.info.role === "assistant" ? result.info.parentID : undefined
+                      return result
+                    }),
+                  ),
               } satisfies TaskPromptOps,
             },
             messages: [],
@@ -1224,7 +1325,11 @@ describe("tool.task", () => {
         yield* Deferred.succeed(childDone, undefined)
         expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.status).toBe("error")
         const notification = yield* Deferred.await(injected)
+        expect(yield* Deferred.await(resumed)).toEqual({ sessionID: chat.id })
         expect(parentPrompts).toBe(1)
+        expect(parentResumes).toBe(1)
+        expect(notification.noReply).toBe(true)
+        expect(resumedParentID).toBe(admittedNotification?.info.id)
         expect(notification.parts).toEqual([
           {
             type: "text",
@@ -1251,6 +1356,10 @@ describe("tool.task", () => {
         const tool = yield* TaskTool
         const def = yield* tool.init()
         const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+        const resumed = yield* Deferred.make<SessionPrompt.LoopInput>()
+        let admittedNotification: SessionV1.WithParts | undefined
+        let parentResumes = 0
+        let resumedParentID: SessionV1.Assistant["parentID"] | undefined
 
         const result = yield* def.execute(
           {
@@ -1271,9 +1380,27 @@ describe("tool.task", () => {
                   input.sessionID === chat.id
                     ? Effect.sync(() => input).pipe(
                         Effect.tap((value) => Deferred.succeed(injected, value)),
-                        Effect.map((value) => reply(value, "injected")),
+                        Effect.map((value) => {
+                          admittedNotification = admit(value)
+                          return admittedNotification
+                        }),
                       )
                     : Effect.die(new Error("")),
+                loop: (input) =>
+                  Effect.sync(() => {
+                    parentResumes += 1
+                    return input
+                  }).pipe(
+                    Effect.tap((value) => Deferred.succeed(resumed, value)),
+                    Effect.map((value) => {
+                      const result = reply(
+                        { sessionID: value.sessionID, messageID: admittedNotification?.info.id, parts: [] },
+                        "resumed",
+                      )
+                      resumedParentID = result.info.role === "assistant" ? result.info.parentID : undefined
+                      return result
+                    }),
+                  ),
               } satisfies TaskPromptOps,
             },
             messages: [],
@@ -1286,6 +1413,10 @@ describe("tool.task", () => {
         expect(waited.info?.status).toBe("error")
         expect(waited.info?.error).toBe("")
         const notification = yield* Deferred.await(injected)
+        expect(yield* Deferred.await(resumed)).toEqual({ sessionID: chat.id })
+        expect(parentResumes).toBe(1)
+        expect(notification.noReply).toBe(true)
+        expect(resumedParentID).toBe(admittedNotification?.info.id)
         expect(notification.parts).toEqual([
           {
             type: "text",

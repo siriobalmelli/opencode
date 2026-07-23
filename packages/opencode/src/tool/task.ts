@@ -243,8 +243,13 @@ export const TaskTool = Tool.define(
             },
           ],
         })
-        const resumed = yield* ops.loop({ sessionID: ctx.sessionID })
-        if (resumed.info.role === "assistant" && resumed.info.parentID === notification.info.id) return
+        const resumed = yield* ops.loop({ sessionID: ctx.sessionID }).pipe(Effect.exit)
+        if (
+          Exit.isSuccess(resumed) &&
+          resumed.value.info.role === "assistant" &&
+          resumed.value.info.parentID === notification.info.id
+        )
+          return
         yield* ops.loop({ sessionID: ctx.sessionID })
       })
 
