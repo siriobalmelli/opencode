@@ -10,10 +10,11 @@ import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
-import { Effect, Exit, Schema } from "effect"
+import { Cause, Effect, Exit, Schema } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
+import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -42,6 +43,8 @@ const BACKGROUND_UPDATED = [
 ].join("\n")
 const EMPTY_FINAL_RESPONSE = "Task completed without a final response"
 const TASK_FAILED = "Task failed"
+const TASK_CANCELLED = "Task cancelled"
+const PARENT_RESUME_ATTEMPTS = 2
 
 const BaseParameterFields = {
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
@@ -66,11 +69,11 @@ export const Parameters = Schema.Struct({
 
 function renderOutput(input: {
   sessionID: SessionID
-  state: "running" | "completed" | "error"
+  state: "running" | "completed" | "error" | "cancelled"
   summary?: string
   text: string
 }) {
-  const tag = input.state === "error" ? "task_error" : "task_result"
+  const tag = input.state === "error" || input.state === "cancelled" ? "task_error" : "task_result"
   return [
     `<task id="${input.sessionID}" state="${input.state}">`,
     ...(input.summary ? [`<summary>${input.summary}</summary>`] : []),
@@ -90,6 +93,7 @@ export const TaskTool = Tool.define(
     const sessions = yield* Session.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const parentResumes = KeyedMutex.makeUnsafe<SessionID>()
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
@@ -218,8 +222,9 @@ export const TaskTool = Tool.define(
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
-        state: "completed" | "error",
+        state: "completed" | "error" | "cancelled",
         text: string,
+        resume: boolean,
       ) {
         const currentParent = yield* sessions.get(ctx.sessionID)
         const notification = yield* ops.prompt({
@@ -237,27 +242,66 @@ export const TaskTool = Tool.define(
                 summary:
                   state === "completed"
                     ? `Background task completed: ${params.description}`
-                    : `Background task failed: ${params.description}`,
+                    : state === "cancelled"
+                      ? `Background task cancelled: ${params.description}`
+                      : `Background task failed: ${params.description}`,
                 text,
               }),
             },
           ],
         })
-        const resumed = yield* ops.loop({ sessionID: ctx.sessionID }).pipe(Effect.exit)
-        if (
-          Exit.isSuccess(resumed) &&
-          resumed.value.info.role === "assistant" &&
-          resumed.value.info.parentID === notification.info.id
+        if (!resume) return
+        yield* parentResumes.withLock(ctx.sessionID)(
+          Effect.gen(function* () {
+            const observations: string[] = []
+            for (let attempt = 1; attempt <= PARENT_RESUME_ATTEMPTS; attempt++) {
+              const resumed = yield* ops.loop({ sessionID: ctx.sessionID }).pipe(Effect.exit)
+              if (Exit.isFailure(resumed)) {
+                observations.push(`attempt ${attempt}: ${Cause.pretty(resumed.cause)}`)
+                continue
+              }
+              observations.push(
+                resumed.value.info.role === "assistant"
+                  ? `attempt ${attempt}: parent=${resumed.value.info.parentID}`
+                  : `attempt ${attempt}: role=${resumed.value.info.role}`,
+              )
+              // Identifier IDs start with fixed-width ascending lowercase hex.
+              // Lexicographic order is therefore chronological.
+              if (resumed.value.info.role === "assistant" && resumed.value.info.parentID >= notification.info.id) return
+            }
+            yield* Effect.logError("background task parent resume was not confirmed", {
+              parent: ctx.sessionID,
+              child: nextSession.id,
+              notification: notification.info.id,
+              attempts: PARENT_RESUME_ATTEMPTS,
+              observations,
+            })
+          }),
         )
-          return
-        yield* ops.loop({ sessionID: ctx.sessionID })
       })
 
       const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (info: BackgroundJob.Info) {
         if (info.metadata?.background !== true) return
-        if (info.status === "completed" && info.output?.trim()) return yield* inject("completed", info.output)
-        if (info.status === "completed") return yield* inject("error", EMPTY_FINAL_RESPONSE)
-        if (info.status === "error") return yield* inject("error", info.error?.trim() || TASK_FAILED)
+        const result =
+          info.status === "completed" && info.output?.trim()
+            ? { state: "completed" as const, text: info.output, resume: true }
+            : info.status === "completed"
+              ? { state: "error" as const, text: EMPTY_FINAL_RESPONSE, resume: true }
+              : info.status === "error"
+                ? { state: "error" as const, text: info.error?.trim() || TASK_FAILED, resume: true }
+                : info.status === "cancelled"
+                  ? { state: "cancelled" as const, text: TASK_CANCELLED, resume: false }
+                  : undefined
+        if (!result) return
+        yield* inject(result.state, result.text, result.resume).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("background task notification delivery failed", {
+              parent: ctx.sessionID,
+              child: nextSession.id,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        )
       })
 
       if (yield* background.extend({ id: nextSession.id, run: runTask() })) {
@@ -288,7 +332,17 @@ export const TaskTool = Tool.define(
             metadata: { ...metadata, background: true, jobId: nextSession.id },
           }),
         ]),
-        onSettled: (settled) => notify(settled).pipe(Effect.catchCause(() => Effect.void)),
+        onSettled: (settled) =>
+          notify(settled).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logError("background task settlement notification failed", {
+                parent: ctx.sessionID,
+                child: nextSession.id,
+                cause: Cause.pretty(cause),
+              }),
+            ),
+            Effect.ignore,
+          ),
         run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
       })
 

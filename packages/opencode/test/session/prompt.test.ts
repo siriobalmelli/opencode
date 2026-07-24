@@ -226,13 +226,22 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makeHttp(input?: {
+  background?: boolean
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+}) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
-    [RuntimeFlags.node, runtimeFlags],
+    [
+      RuntimeFlags.node,
+      input?.background
+        ? RuntimeFlags.layer({ experimentalBackgroundSubagents: true, experimentalEventSystem: true })
+        : runtimeFlags,
+    ],
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -245,6 +254,7 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 }
 
 const it = testEffect(makeHttp())
+const backgroundIt = testEffect(makeHttp({ background: true }))
 const overflow = it
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
@@ -3283,6 +3293,81 @@ it.instance("failed subtask preserves metadata on error tool state", () =>
       modelID: ModelV2.ID.make("missing-model"),
     })
   }),
+)
+
+backgroundIt.instance(
+  "background task settlement persists before resuming the parent",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        agent: {
+          build: { mode: "primary", model: "test/test-model" },
+          general: { mode: "subagent", model: "test/test-model" },
+        },
+      }))
+      const jobs = yield* BackgroundJob.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Background settlement",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.tool("task", {
+        description: "complete child",
+        prompt: "complete child",
+        subagent_type: "general",
+        background: true,
+      })
+      yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("complete child"), "child complete")
+      yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("Background task"), "parent resumed")
+      yield* llm.text("parent idle")
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "start" }],
+      })
+      yield* prompt.loop({ sessionID: chat.id })
+
+      const child = (yield* sessions.children(chat.id))[0]
+      if (!child) return yield* Effect.die("missing background child")
+      expect((yield* jobs.wait({ id: child.id, timeout: 2_000 })).info?.status).toBe("completed")
+      const notification = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const messages = yield* sessions.messages({ sessionID: chat.id })
+          return messages.find(
+            (message) =>
+              message.info.role === "user" &&
+              message.parts.some(
+                (part) =>
+                  part.type === "text" &&
+                  part.synthetic &&
+                  part.text.includes(`<task id="${child.id}" state="completed">`),
+              ),
+          )
+        }),
+        "timed out waiting for durable background settlement notification",
+        "5 seconds",
+      )
+      const resumed = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const messages = yield* sessions.messages({ sessionID: chat.id })
+          const resumed = messages.findLast(
+            (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+              message.info.role === "assistant" &&
+              message.info.parentID >= notification.info.id &&
+              message.parts.some((part) => part.type === "text" && part.text === "parent resumed"),
+          )
+          return resumed
+        }),
+        "timed out waiting for parent resume after background settlement notification",
+        "15 seconds",
+      )
+      expect(notification.info.role).toBe("user")
+      expect(resumed.info.parentID >= notification.info.id).toBe(true)
+    }),
+  25_000,
 )
 
 it.instance("subtask child inherits parent session external_directory allow", () =>
