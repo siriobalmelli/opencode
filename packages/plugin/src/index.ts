@@ -216,6 +216,49 @@ export type ProviderHook = {
   models?: (provider: ProviderV2, ctx: ProviderHookContext) => Promise<Record<string, ModelV2>>
 }
 
+export type ModelTuple = {
+  providerID: string
+  modelID: string
+  variant?: string
+}
+
+// "unknown" is reserved and treated as unhandled by core routing.
+export type ProviderFailure =
+  | "auth"
+  | "rate_limit"
+  | "server"
+  | "network"
+  | "protocol_empty"
+  | "config_model"
+  | "overflow"
+  | "unknown"
+
+export type ChatProviderFailureInput = {
+  sessionID: string
+  userMessageID: string
+  agent: string
+  model: ModelTuple
+  failure: ProviderFailure
+  statusCode?: number
+  retryAfterMs?: number
+  /**
+   * Tool states observed when the provider failure occurred.
+   * This is not a terminal state and cannot authorize a fallback handoff.
+   */
+  observedTools: {
+    pending: number
+    running: number
+    interrupted: number
+    errored: number
+    completed: number
+  }
+}
+
+export type ChatProviderFailureOutput = {
+  action: "unhandled" | "stop" | "fallback"
+  models: ModelTuple[]
+}
+
 /** @deprecated Use AuthOAuthResult instead. */
 export type AuthOuathResult = AuthOAuthResult
 
@@ -258,6 +301,7 @@ export interface Hooks {
     input: { sessionID: string; agent: string; model: Model; provider: ProviderContext; message: UserMessage },
     output: { headers: Record<string, string> },
   ) => Promise<void>
+  "chat.provider.failure"?: (input: ChatProviderFailureInput, output: ChatProviderFailureOutput) => Promise<void>
   "permission.ask"?: (input: Permission, output: { status: "ask" | "deny" | "allow" }) => Promise<void>
   "command.execute.before"?: (
     input: { command: string; sessionID: string; arguments: string },

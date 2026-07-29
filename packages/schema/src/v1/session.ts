@@ -329,6 +329,35 @@ const messageBase = {
   sessionID: partBase.sessionID,
 }
 
+export const RoutedHandoffFailure = Schema.Literals([
+  "auth",
+  "rate_limit",
+  "server",
+  "network",
+  "protocol_empty",
+  "config_model",
+  "overflow",
+  "unknown",
+]).annotate({ identifier: "RoutedHandoffFailure" })
+export type RoutedHandoffFailure = Schema.Schema.Type<typeof RoutedHandoffFailure>
+
+export const RoutedHandoffModel = Schema.Struct({
+  providerID: Provider.ID,
+  modelID: Model.ID,
+  variant: optional(Schema.String),
+}).annotate({ identifier: "RoutedHandoffModel" })
+export type RoutedHandoffModel = Schema.Schema.Type<typeof RoutedHandoffModel>
+
+export const RoutedHandoff = Schema.Struct({
+  id: Schema.String,
+  status: Schema.Literals(["pending", "applied"]),
+  failure: RoutedHandoffFailure,
+  from: RoutedHandoffModel,
+  next: RoutedHandoffModel,
+  userMessageID: MessageID,
+}).annotate({ identifier: "RoutedHandoff" })
+export type RoutedHandoff = Schema.Schema.Type<typeof RoutedHandoff>
+
 export const User = Schema.Struct({
   ...messageBase,
   role: Schema.Literal("user"),
@@ -351,6 +380,7 @@ export const User = Schema.Struct({
   }),
   system: Schema.optional(Schema.String),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
+  routedHandoff: optional(RoutedHandoff),
 }).annotate({ identifier: "UserMessage" })
 export type User = Types.DeepMutable<Schema.Schema.Type<typeof User>>
 
@@ -482,6 +512,8 @@ export const Assistant = Schema.Struct({
   structured: Schema.optional(Schema.Any),
   variant: Schema.optional(Schema.String),
   finish: Schema.optional(Schema.String),
+  routedHandoff: optional(RoutedHandoff),
+  routedHandoffID: optional(Schema.String),
 }).annotate({ identifier: "AssistantMessage" })
 export type Assistant = Omit<Types.DeepMutable<Schema.Schema.Type<typeof Assistant>>, "error"> & {
   error?: AssistantError

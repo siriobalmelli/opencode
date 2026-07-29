@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Npm } from "@opencode-ai/core/npm"
@@ -8,6 +8,8 @@ import { Account } from "../../src/account/account"
 import { Auth } from "../../src/auth"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
 import { Plugin } from "../../src/plugin/index"
+import { triggerProviderFailure } from "../../src/plugin/index"
+import type { ChatProviderFailureInput, Hooks } from "@opencode-ai/plugin"
 
 import { TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -28,6 +30,15 @@ const it = testEffect(
   ]),
 )
 const systemHook = "experimental.chat.system.transform"
+
+const providerFailureInput: ChatProviderFailureInput = {
+  sessionID: "ses_test",
+  userMessageID: "msg_test",
+  agent: "build",
+  model: { providerID: "test", modelID: "test-model", variant: "primary" },
+  failure: "server",
+  observedTools: { pending: 0, running: 0, interrupted: 0, errored: 0, completed: 1 },
+}
 
 function withProject<A, E, R>(source: string, self: Effect.Effect<A, E, R>) {
   return Effect.gen(function* () {
@@ -72,6 +83,11 @@ const triggerSystemTransform = Effect.fn("PluginTriggerTest.triggerSystemTransfo
   return out.system
 })
 
+const triggerFailure = Effect.fn("PluginTriggerTest.triggerFailure")(function* () {
+  const plugin = yield* Plugin.Service
+  return yield* plugin.triggerProviderFailure(providerFailureInput)
+})
+
 describe("plugin.trigger", () => {
   it.instance("runs synchronous hooks without crashing", () =>
     withProject(
@@ -105,4 +121,85 @@ describe("plugin.trigger", () => {
       }),
     ),
   )
+})
+
+describe("plugin.triggerProviderFailure", () => {
+  it.instance("converts thrown hooks to typed failures", () =>
+    withProject(
+      'export default async () => ({ "chat.provider.failure": () => { throw new Error("provider hook exploded") } })',
+      Effect.gen(function* () {
+        expect(yield* triggerFailure().pipe(Effect.flip)).toBe("provider hook exploded")
+      }),
+    ),
+  )
+
+  test("returns unhandled when no hook is registered", async () => {
+    await expect(triggerProviderFailure([], providerFailureInput)).resolves.toEqual({ action: "unhandled", models: [] })
+  })
+
+  test("stops at the first handled stop", async () => {
+    let laterCalled = false
+    let received: ChatProviderFailureInput | undefined
+    const hooks: Hooks[] = [
+      {
+        "chat.provider.failure": async (input, output) => {
+          received = input
+          output.action = "stop"
+        },
+      },
+      {
+        "chat.provider.failure": async () => {
+          laterCalled = true
+        },
+      },
+    ]
+
+    await expect(triggerProviderFailure(hooks, providerFailureInput)).resolves.toEqual({ action: "stop", models: [] })
+    expect(received?.observedTools).toEqual({ pending: 0, running: 0, interrupted: 0, errored: 0, completed: 1 })
+    expect(laterCalled).toBe(false)
+  })
+
+  test("stops at the first handled fallback", async () => {
+    let laterCalled = false
+    const hooks: Hooks[] = [
+      {
+        "chat.provider.failure": async (_input, output) => {
+          output.action = "fallback"
+          output.models.push({ providerID: "fallback", modelID: "next", variant: "secondary" })
+        },
+      },
+      {
+        "chat.provider.failure": async () => {
+          laterCalled = true
+        },
+      },
+    ]
+
+    await expect(triggerProviderFailure(hooks, providerFailureInput)).resolves.toEqual({
+      action: "fallback",
+      models: [{ providerID: "fallback", modelID: "next", variant: "secondary" }],
+    })
+    expect(laterCalled).toBe(false)
+  })
+
+  test("never falls back from an unknown failure", async () => {
+    const hooks: Hooks[] = [
+      {
+        "chat.provider.failure": async (_input, output) => {
+          output.action = "fallback"
+          output.models.push({ providerID: "fallback", modelID: "next" })
+        },
+      },
+      {
+        "chat.provider.failure": async (_input, output) => {
+          output.action = "stop"
+        },
+      },
+    ]
+
+    await expect(triggerProviderFailure(hooks, { ...providerFailureInput, failure: "unknown" })).resolves.toEqual({
+      action: "stop",
+      models: [],
+    })
+  })
 })

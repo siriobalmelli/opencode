@@ -1,5 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import type {
+  ChatProviderFailureInput,
+  ChatProviderFailureOutput,
   Hooks,
   PluginInput,
   Plugin as PluginInstance,
@@ -37,9 +39,12 @@ type State = {
 }
 
 // Hook names that follow the (input, output) => Promise<void> trigger pattern
-type TriggerName = {
-  [K in keyof Hooks]-?: NonNullable<Hooks[K]> extends (input: any, output: any) => Promise<void> ? K : never
-}[keyof Hooks]
+type TriggerName = Exclude<
+  {
+    [K in keyof Hooks]-?: NonNullable<Hooks[K]> extends (input: any, output: any) => Promise<void> ? K : never
+  }[keyof Hooks],
+  "chat.provider.failure"
+>
 
 export interface Interface {
   readonly trigger: <
@@ -51,8 +56,21 @@ export interface Interface {
     input: Input,
     output: Output,
   ) => Effect.Effect<Output>
+  readonly triggerProviderFailure: (input: ChatProviderFailureInput) => Effect.Effect<ChatProviderFailureOutput, string>
   readonly list: () => Effect.Effect<Hooks[]>
   readonly init: () => Effect.Effect<void>
+}
+
+export async function triggerProviderFailure(hooks: Hooks[], input: ChatProviderFailureInput) {
+  for (const hook of hooks) {
+    const fn = hook["chat.provider.failure"]
+    if (!fn) continue
+    const output: ChatProviderFailureOutput = { action: "unhandled", models: [] }
+    await fn(input, output)
+    if (input.failure === "unknown" && output.action === "fallback") continue
+    if (output.action !== "unhandled") return output
+  }
+  return { action: "unhandled", models: [] } satisfies ChatProviderFailureOutput
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Plugin") {}
@@ -292,6 +310,16 @@ const layer = Layer.effect(
       return output
     })
 
+    const triggerProviderFailureEffect = Effect.fn("Plugin.triggerProviderFailure")(function* (
+      input: ChatProviderFailureInput,
+    ) {
+      const s = yield* InstanceState.get(state)
+      return yield* Effect.tryPromise({
+        try: () => triggerProviderFailure(s.hooks, input),
+        catch: errorMessage,
+      })
+    })
+
     const list = Effect.fn("Plugin.list")(function* () {
       const s = yield* InstanceState.get(state)
       return s.hooks
@@ -301,7 +329,7 @@ const layer = Layer.effect(
       yield* InstanceState.get(state)
     })
 
-    return Service.of({ trigger, list, init })
+    return Service.of({ trigger, triggerProviderFailure: triggerProviderFailureEffect, list, init })
   }),
 )
 
