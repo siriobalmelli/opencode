@@ -3,7 +3,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -478,6 +478,55 @@ describe("tool.task", () => {
     },
   )
 
+  it.instance(
+    "fails foreground task with Task failed when the child diagnostic is empty",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const exit = yield* def
+          .execute(
+            {
+              description: "inspect bug",
+              prompt: "look into the cache key path",
+              subagent_type: "reviewer",
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: {
+                promptOps: {
+                  ...stubOps(),
+                  prompt: () => Effect.die(new Error("")),
+                } satisfies TaskPromptOps,
+              },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toMatchObject({ message: "Task failed" })
+      }),
+    {
+      config: {
+        agent: {
+          reviewer: {
+            mode: "subagent",
+            permission: {
+              task: "allow",
+            },
+          },
+        },
+      },
+    },
+  )
+
   it.instance("prevents subagents from launching subagents by default", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
@@ -761,111 +810,346 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("background task completion waits for running updates", () =>
-    Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-      const first = defer<void>()
-      const second = defer<void>()
-      const updated = defer<SessionPrompt.PromptInput>()
-      const injected = defer<SessionPrompt.PromptInput>()
-      let prompts = 0
-      const promptOps: TaskPromptOps = {
-        ...stubOps(),
-        prompt: (input) => {
-          if (input.sessionID === chat.id) {
-            injected.resolve(input)
-            return Effect.succeed(reply(input, "done"))
-          }
-          prompts++
-          if (prompts === 1) return Effect.promise(() => first.promise).pipe(Effect.as(reply(input, "first done")))
-          updated.resolve(input)
-          return Effect.promise(() => second.promise).pipe(Effect.as(reply(input, "second done")))
-        },
-      }
-      const context = {
-        sessionID: chat.id,
-        messageID: assistant.id,
-        agent: "build",
-        abort: new AbortController().signal,
-        extra: { promptOps },
-        messages: [],
-        metadata: () => Effect.void,
-        ask: () => Effect.void,
-      }
-
-      const started = yield* def.execute(
-        {
-          description: "inspect bug",
-          prompt: "look into the cache key path",
-          subagent_type: "general",
-          background: true,
-        },
-        context,
-      )
-      const result = yield* def.execute(
-        {
-          description: "add investigation scope",
-          prompt: "also inspect cancellation",
-          subagent_type: "general",
-          task_id: started.metadata.sessionId,
-        },
-        context,
-      )
-
-      expect(result.metadata.sessionId).toBe(started.metadata.sessionId)
-      expect(result.metadata.background).toBe(true)
-      expect(result.output).toContain("Background task updated")
-      first.resolve()
-      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
-      expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([
-        { type: "text", text: "also inspect cancellation" },
-      ])
-
-      second.resolve()
-      const waited = yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })
-      expect(waited.info?.status).toBe("completed")
-      expect(waited.info?.output).toBe("second done")
-      const notification = yield* Effect.promise(() => injected.promise)
-      expect(notification.variant).toBe("xhigh")
-      expect(notification.parts[0]?.type).toBe("text")
-      if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("second done")
-    }),
-  )
-
-  background.instance("background tasks complete through the background job service", () =>
-    Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-
-      const result = yield* def.execute(
-        {
-          description: "inspect bug",
-          prompt: "look into the cache key path",
-          subagent_type: "general",
-          background: true,
-        },
-        {
+  background.instance(
+    "background task completion waits for running updates",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const first = defer<void>()
+        const second = defer<void>()
+        const updated = defer<SessionPrompt.PromptInput>()
+        const injected = defer<SessionPrompt.PromptInput>()
+        let prompts = 0
+        let notifications = 0
+        const promptOps: TaskPromptOps = {
+          ...stubOps(),
+          prompt: (input) => {
+            if (input.sessionID === chat.id) {
+              notifications += 1
+              injected.resolve(input)
+              return Effect.succeed(reply(input, "done"))
+            }
+            prompts++
+            if (prompts === 1) return Effect.promise(() => first.promise).pipe(Effect.as(reply(input, "first done")))
+            updated.resolve(input)
+            return Effect.promise(() => second.promise).pipe(Effect.as(reply(input, "second done")))
+          },
+        }
+        const context = {
           sessionID: chat.id,
           messageID: assistant.id,
           agent: "build",
           abort: new AbortController().signal,
-          extra: { promptOps: stubOps({ text: "background done" }) },
+          extra: { promptOps },
           messages: [],
           metadata: () => Effect.void,
           ask: () => Effect.void,
-        },
-      )
+        }
 
-      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
-      expect(waited.timedOut).toBe(false)
-      expect(waited.info?.status).toBe("completed")
-      expect(waited.info?.output).toBe("background done")
-    }),
+        const started = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "reviewer",
+            background: true,
+          },
+          context,
+        )
+        const result = yield* def.execute(
+          {
+            description: "add investigation scope",
+            prompt: "also inspect cancellation",
+            subagent_type: "reviewer",
+            task_id: started.metadata.sessionId,
+          },
+          context,
+        )
+
+        expect(result.metadata.sessionId).toBe(started.metadata.sessionId)
+        expect(result.metadata.background).toBe(true)
+        expect(result.output).toContain("Background task updated")
+        first.resolve()
+        expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
+        expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([
+          { type: "text", text: "also inspect cancellation" },
+        ])
+        expect(prompts).toBe(2)
+        expect(notifications).toBe(0)
+
+        second.resolve()
+        const waited = yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })
+        expect(waited.info?.status).toBe("completed")
+        expect(waited.info?.output).toBe("second done")
+        const notification = yield* Effect.promise(() => injected.promise)
+        expect(notifications).toBe(1)
+        expect(notification.variant).toBe("xhigh")
+        expect(notification.parts[0]?.type).toBe("text")
+        if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("second done")
+      }),
+    {
+      config: { agent: { reviewer: { mode: "subagent", permission: { task: "allow" } } } },
+    },
+  )
+
+  background.instance(
+    "background task completion injects its non-empty result into the parent",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const parentPrompts: SessionPrompt.PromptInput[] = []
+        const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "reviewer",
+            background: true,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: {
+                ...stubOps({ text: "background done" }),
+                prompt: (input) => {
+                  if (input.sessionID !== chat.id) return Effect.succeed(reply(input, "background done"))
+                  return Effect.sync(() => {
+                    parentPrompts.push(input)
+                    return input
+                  }).pipe(
+                    Effect.tap((value) => Deferred.succeed(injected, value)),
+                    Effect.map((value) => reply(value, "injected")),
+                  )
+                },
+              } satisfies TaskPromptOps,
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+        expect(waited.timedOut).toBe(false)
+        expect(waited.info?.status).toBe("completed")
+        expect(waited.info?.output).toBe("background done")
+        const notification = yield* Deferred.await(injected)
+        expect(parentPrompts).toEqual([notification])
+        expect(notification.parts).toEqual([
+          {
+            type: "text",
+            synthetic: true,
+            text: expect.stringContaining(`<task id="${result.metadata.sessionId}" state="completed">`),
+          },
+        ])
+        if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("background done")
+      }),
+    {
+      config: { agent: { reviewer: { mode: "subagent", permission: { task: "allow" } } } },
+    },
+  )
+
+  background.instance(
+    "background empty output fails and injects one non-empty synthetic error",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+        let parentPrompts = 0
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "reviewer",
+            background: true,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: {
+                ...stubOps({ text: "   \n\t " }),
+                prompt: (input) => {
+                  if (input.sessionID !== chat.id) return Effect.succeed(reply(input, "   \n\t "))
+                  return Effect.sync(() => {
+                    parentPrompts += 1
+                    return input
+                  }).pipe(
+                    Effect.tap((value) => Deferred.succeed(injected, value)),
+                    Effect.map((value) => reply(value, "injected")),
+                  )
+                },
+              } satisfies TaskPromptOps,
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+        expect(waited.info?.status).toBe("error")
+        expect(waited.info?.error).toBe("Task completed without a final response")
+        const notification = yield* Deferred.await(injected)
+        expect(parentPrompts).toBe(1)
+        expect(notification.parts).toEqual([
+          {
+            type: "text",
+            synthetic: true,
+            text: expect.stringContaining(`<task id="${result.metadata.sessionId}" state="error">`),
+          },
+        ])
+        if (notification.parts[0]?.type === "text") {
+          expect(notification.parts[0].text).toContain("Task completed without a final response")
+          expect(notification.parts[0].text).toContain("<task_error>")
+        }
+      }),
+    {
+      config: { agent: { reviewer: { mode: "subagent", permission: { task: "allow" } } } },
+    },
+  )
+
+  background.instance(
+    "background failure injects after the originating tool scope closes",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const toolScope = yield* Scope.make()
+        const tool = yield* TaskTool.pipe(Scope.provide(toolScope))
+        const def = yield* tool.init()
+        const childDone = yield* Deferred.make<void>()
+        const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+        let parentPrompts = 0
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "reviewer",
+            background: true,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: {
+                ...stubOps(),
+                prompt: (input) => {
+                  if (input.sessionID !== chat.id) {
+                    return Deferred.await(childDone).pipe(Effect.as(reply(input, " \n\t ")))
+                  }
+                  return Effect.sync(() => {
+                    parentPrompts += 1
+                    return input
+                  }).pipe(
+                    Effect.tap((value) => Deferred.succeed(injected, value)),
+                    Effect.map((value) => reply(value, "injected")),
+                  )
+                },
+              } satisfies TaskPromptOps,
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        yield* Scope.close(toolScope, Exit.void)
+        yield* Deferred.succeed(childDone, undefined)
+        expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.status).toBe("error")
+        const notification = yield* Deferred.await(injected)
+        expect(parentPrompts).toBe(1)
+        expect(notification.parts).toEqual([
+          {
+            type: "text",
+            synthetic: true,
+            text: expect.stringContaining(`<task id="${result.metadata.sessionId}" state="error">`),
+          },
+        ])
+        if (notification.parts[0]?.type === "text") {
+          expect(notification.parts[0].text).toContain("Task completed without a final response")
+          expect(notification.parts[0].text.trim()).not.toBe("")
+        }
+      }),
+    {
+      config: { agent: { reviewer: { mode: "subagent", permission: { task: "allow" } } } },
+    },
+  )
+
+  background.instance(
+    "background child errors with empty diagnostics inject Task failed",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "reviewer",
+            background: true,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: {
+                ...stubOps(),
+                prompt: (input) =>
+                  input.sessionID === chat.id
+                    ? Effect.sync(() => input).pipe(
+                        Effect.tap((value) => Deferred.succeed(injected, value)),
+                        Effect.map((value) => reply(value, "injected")),
+                      )
+                    : Effect.die(new Error("")),
+              } satisfies TaskPromptOps,
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+        expect(waited.info?.status).toBe("error")
+        expect(waited.info?.error).toBe("")
+        const notification = yield* Deferred.await(injected)
+        expect(notification.parts).toEqual([
+          {
+            type: "text",
+            synthetic: true,
+            text: expect.stringContaining(`<task id="${result.metadata.sessionId}" state="error">`),
+          },
+        ])
+        if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("Task failed")
+      }),
+    {
+      config: { agent: { reviewer: { mode: "subagent", permission: { task: "allow" } } } },
+    },
   )
 
   background.instance("background task completion does not wait for the parent async prompt", () =>
@@ -984,43 +1268,56 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("cancelling the parent run cancels running background tasks", () =>
-    Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
-      const runState = yield* SessionRunState.Service
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
+  background.instance(
+    "cancelling the parent run cancels running background tasks",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const runState = yield* SessionRunState.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let parentPrompts = 0
 
-      const result = yield* def.execute(
-        {
-          description: "inspect bug",
-          prompt: "look into the cache key path",
-          subagent_type: "general",
-          background: true,
-        },
-        {
-          sessionID: chat.id,
-          messageID: assistant.id,
-          agent: "build",
-          abort: new AbortController().signal,
-          extra: {
-            promptOps: {
-              ...stubOps(),
-              prompt: () => Effect.never,
-            } satisfies TaskPromptOps,
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "reviewer",
+            background: true,
           },
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-        },
-      )
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: {
+                ...stubOps(),
+                prompt: (input) =>
+                  input.sessionID === chat.id
+                    ? Effect.sync(() => {
+                        parentPrompts += 1
+                        return reply(input, "injected")
+                      })
+                    : Effect.never,
+              } satisfies TaskPromptOps,
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
 
-      yield* runState.cancel(chat.id)
-      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
-      expect(waited.timedOut).toBe(false)
-      expect(waited.info?.status).toBe("cancelled")
-    }),
+        yield* runState.cancel(chat.id)
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+        expect(waited.timedOut).toBe(false)
+        expect(waited.info?.status).toBe("cancelled")
+        expect(parentPrompts).toBe(0)
+      }),
+    {
+      config: { agent: { reviewer: { mode: "subagent", permission: { task: "allow" } } } },
+    },
   )
 
   it.instance("cancelling a child run cancels its own pre-runner task job", () =>

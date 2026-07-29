@@ -103,6 +103,28 @@ function assistantInfo(
   } as unknown as SessionV1.Assistant
 }
 
+function routedHandoff(
+  userMessageID: string,
+  from = { providerID: "test", modelID: "test-model", variant: "primary" },
+) {
+  return {
+    id: "handoff-1",
+    status: "pending" as const,
+    failure: "server" as const,
+    from: {
+      providerID: ProviderV2.ID.make(from.providerID),
+      modelID: ModelV2.ID.make(from.modelID),
+      variant: from.variant,
+    },
+    next: {
+      providerID: model.providerID,
+      modelID: model.id,
+      variant: "fallback",
+    },
+    userMessageID: MessageID.make(userMessageID),
+  }
+}
+
 function basePart(messageID: string, id: string) {
   return {
     id: PartID.make(id.startsWith("prt") ? id : `prt_${id}`),
@@ -986,6 +1008,174 @@ describe("session.message-v2.toModelMessage", () => {
     ]
 
     expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
+  })
+
+  test("projects only completed tools from routed provider failures", async () => {
+    const assistantID = "m-assistant"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: {
+          ...assistantInfo(
+            assistantID,
+            "m-parent",
+            new SessionV1.APIError({ message: "boom", isRetryable: true }).toObject() as SessionV1.APIError,
+          ),
+          routedHandoff: routedHandoff("msg_parent"),
+        } as SessionV1.Assistant,
+        parts: [
+          { ...basePart(assistantID, "text"), type: "text", text: "partial answer" },
+          { ...basePart(assistantID, "reasoning"), type: "reasoning", text: "partial reasoning", time: { start: 0 } },
+          {
+            ...basePart(assistantID, "completed"),
+            type: "tool",
+            callID: "call-completed",
+            tool: "read",
+            state: {
+              status: "completed",
+              input: { filePath: "README.md" },
+              output: "done",
+              title: "Read",
+              metadata: {},
+              time: { start: 0, end: 1 },
+            },
+          },
+          {
+            ...basePart(assistantID, "errored"),
+            type: "tool",
+            callID: "call-errored",
+            tool: "bash",
+            state: { status: "error", input: {}, error: "failed", metadata: {}, time: { start: 0, end: 1 } },
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-completed",
+            toolName: "read",
+            input: { filePath: "README.md" },
+            providerExecuted: undefined,
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-completed",
+            toolName: "read",
+            output: { type: "text", value: "done" },
+          },
+        ],
+      },
+    ])
+  })
+
+  test("does not project unsafe routed handoff tool states", async () => {
+    const assistantID = "m-assistant"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: {
+          ...assistantInfo(
+            assistantID,
+            "m-parent",
+            new SessionV1.APIError({ message: "boom", isRetryable: true }).toObject() as SessionV1.APIError,
+          ),
+          routedHandoff: routedHandoff("msg_parent"),
+        } as SessionV1.Assistant,
+        parts: [
+          {
+            ...basePart(assistantID, "pending"),
+            type: "tool",
+            callID: "call-pending",
+            tool: "read",
+            state: { status: "pending", input: {}, raw: "" },
+          },
+          {
+            ...basePart(assistantID, "running"),
+            type: "tool",
+            callID: "call-running",
+            tool: "read",
+            state: { status: "running", input: {}, time: { start: 0 } },
+          },
+          {
+            ...basePart(assistantID, "error"),
+            type: "tool",
+            callID: "call-error",
+            tool: "read",
+            state: { status: "error", input: {}, error: "interrupted", metadata: {}, time: { start: 0, end: 1 } },
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
+  })
+
+  test("strips provider metadata from cross-provider routed handoffs", async () => {
+    const assistantID = "m-assistant"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: {
+          ...assistantInfo(
+            assistantID,
+            "m-parent",
+            new SessionV1.APIError({ message: "boom", isRetryable: true }).toObject() as SessionV1.APIError,
+            { providerID: "other", modelID: "other" },
+          ),
+          routedHandoff: routedHandoff("msg_parent", { providerID: "other", modelID: "other", variant: "primary" }),
+        } as SessionV1.Assistant,
+        parts: [
+          {
+            ...basePart(assistantID, "completed"),
+            type: "tool",
+            callID: "call-completed",
+            tool: "read",
+            state: {
+              status: "completed",
+              input: { filePath: "README.md" },
+              output: "done",
+              title: "Read",
+              metadata: {},
+              time: { start: 0, end: 1 },
+            },
+            metadata: { openai: { call: "metadata" } },
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-completed",
+            toolName: "read",
+            input: { filePath: "README.md" },
+            providerExecuted: undefined,
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-completed",
+            toolName: "read",
+            output: { type: "text", value: "done" },
+          },
+        ],
+      },
+    ])
   })
 
   test("includes aborted assistant messages only when they have non-step-start/reasoning content", async () => {

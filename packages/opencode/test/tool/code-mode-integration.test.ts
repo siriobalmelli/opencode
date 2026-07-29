@@ -142,6 +142,7 @@ async function buildTool() {
     Layer.mock(Plugin.Service, {
       trigger: ((_name: unknown, _input: unknown, output: unknown) =>
         Effect.succeed(output)) as Plugin.Interface["trigger"],
+      triggerProviderFailure: () => Effect.succeed({ action: "unhandled", models: [] }),
     }),
     Layer.mock(Truncate.Service, {
       output: (text: string) => Effect.succeed({ content: text, truncated: false as const }),

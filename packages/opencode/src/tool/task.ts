@@ -10,7 +10,7 @@ import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
-import { Effect, Exit, Schema, Scope } from "effect"
+import { Effect, Exit, Schema } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
@@ -39,6 +39,8 @@ const BACKGROUND_UPDATED = [
   "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.",
   "Work on non-overlapping tasks, or briefly tell the user what you sent and end your response.",
 ].join("\n")
+const EMPTY_FINAL_RESPONSE = "Task completed without a final response"
+const TASK_FAILED = "Task failed"
 
 const BaseParameterFields = {
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
@@ -85,7 +87,6 @@ export const TaskTool = Tool.define(
     const background = yield* BackgroundJob.Service
     const config = yield* Config.Service
     const sessions = yield* Session.Service
-    const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
 
@@ -210,7 +211,9 @@ export const TaskTool = Tool.define(
           agent: next.name,
           parts,
         })
-        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        const output = result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        if (!output.trim()) return yield* Effect.fail(new Error(EMPTY_FINAL_RESPONSE))
+        return output
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
@@ -239,18 +242,14 @@ export const TaskTool = Tool.define(
               },
             ],
           })
-          .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+          .pipe(Effect.ignore)
       })
 
-      const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (jobID: string) {
-        yield* background.wait({ id: jobID }).pipe(
-          Effect.flatMap((result) => {
-            if (result.info?.status === "completed") return inject("completed", result.info.output ?? "")
-            if (result.info?.status === "error") return inject("error", result.info.error ?? "")
-            return Effect.void
-          }),
-          Effect.forkIn(scope, { startImmediately: true }),
-        )
+      const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (info: BackgroundJob.Info) {
+        if (info.metadata?.background !== true) return
+        if (info.status === "completed" && info.output?.trim()) return yield* inject("completed", info.output)
+        if (info.status === "completed") return yield* inject("error", EMPTY_FINAL_RESPONSE)
+        if (info.status === "error") return yield* inject("error", info.error?.trim() || TASK_FAILED)
       })
 
       if (yield* background.extend({ id: nextSession.id, run: runTask() })) {
@@ -280,8 +279,8 @@ export const TaskTool = Tool.define(
             title: params.description,
             metadata: { ...metadata, background: true, jobId: nextSession.id },
           }),
-          notify(nextSession.id),
         ]),
+        onSettled: (settled) => notify(settled).pipe(Effect.catchCause(() => Effect.void)),
         run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
       })
 
@@ -303,7 +302,6 @@ export const TaskTool = Tool.define(
       }
 
       if (runInBackground) {
-        yield* notify(info.id)
         return backgroundResult()
       }
 
@@ -325,9 +323,9 @@ export const TaskTool = Tool.define(
               background.waitForPromotion(nextSession.id),
             )
             if (result?.metadata?.background === true) return backgroundResult()
-            if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
+            if (result?.status === "error") return yield* Effect.fail(new Error(result.error?.trim() || TASK_FAILED))
             if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
-            if (!result?.output?.trim()) return yield* Effect.fail(new Error("Task completed without a final response"))
+            if (!result?.output?.trim()) return yield* Effect.fail(new Error(EMPTY_FINAL_RESPONSE))
             return {
               title: params.description,
               metadata,

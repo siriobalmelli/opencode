@@ -46,6 +46,7 @@ function harness(input: {
   return Layer.mergeAll(
     Layer.mock(Plugin.Service, {
       trigger: input.trigger ?? (((_name, _input, output) => Effect.succeed(output)) as Plugin.Interface["trigger"]),
+      triggerProviderFailure: () => Effect.succeed({ action: "unhandled", models: [] }),
     }),
     Layer.mock(Truncate.Service, {
       output: (text: string) => Effect.succeed({ content: text, truncated: false as const }),

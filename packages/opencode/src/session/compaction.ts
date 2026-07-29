@@ -384,6 +384,7 @@ const layer = Layer.effect(
         assistantMessage: msg,
         sessionID: input.sessionID,
         model,
+        provider,
       })
       const result = yield* processor.process({
         user: userMessage,
@@ -400,6 +401,13 @@ const layer = Layer.effect(
         ],
         model,
       })
+
+      if (typeof result === "object" && result.type === "handoff") {
+        // Compaction does not propagate failover handoffs into the parent loop.
+        processor.message.routedHandoff = undefined
+        yield* session.updateMessage(processor.message)
+        return "stop"
+      }
 
       if (result === "compact") {
         processor.message.error = new SessionV1.ContextOverflowError({
@@ -507,7 +515,9 @@ const layer = Layer.effect(
       if (result === "continue") {
         yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
       }
-      return result
+      // Handoff and compact results return above.
+      // The compound handoff object/type guard does not narrow the residual union.
+      return result as "continue" | "stop"
     })
 
     const create = Effect.fn("SessionCompaction.create")(function* (input: {

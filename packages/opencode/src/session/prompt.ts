@@ -56,6 +56,9 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { validateFallbackCandidates } from "./routing"
+import { usable } from "./overflow"
+import { Token } from "@/util/token"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -70,6 +73,23 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "image/png",
   "image/webp",
 ])
+
+export const overflowMinimumEstimate = Effect.fn("SessionPrompt.overflowMinimumEstimate")(function* (
+  messages: unknown,
+  current: () => number,
+) {
+  const exit = yield* Effect.exit(
+    Effect.sync(() => {
+      const serialized = JSON.stringify(messages)
+      if (typeof serialized !== "string") return undefined
+      const estimate = Token.estimate(serialized)
+      const capacity = current()
+      if (!Number.isFinite(estimate) || !Number.isFinite(capacity) || capacity <= 0) return undefined
+      return Math.max(estimate, capacity + 1)
+    }),
+  )
+  return Exit.isSuccess(exit) ? exit.value : undefined
+})
 
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
 
@@ -97,6 +117,13 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   // cleanup() marks abandoned tool_use blocks this way after retries/aborts.
   // They are not pending work and must not trigger an assistant-prefill request.
   return part.state.status === "error" && part.state.metadata?.interrupted === true
+}
+
+function isProtocolEmpty(parts: SessionV1.Part[]) {
+  return parts.every((part) => {
+    if (part.type === "text") return part.text.trim().length === 0
+    return part.type === "reasoning" || part.type === "step-start" || part.type === "step-finish"
+  })
 }
 
 export interface Interface {
@@ -141,6 +168,32 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
     const { db } = database
+    const discardPendingHandoff = Effect.fnUntraced(function* (sessionID: SessionID) {
+      const msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+        Effect.provideService(Database.Service, database),
+      )
+      const { user: lastUser } = MessageV2.latest(msgs)
+      if (!lastUser) return
+      const pending = msgs
+        .filter(
+          (msg): msg is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+            msg.info.role === "assistant" &&
+            msg.info.parentID === lastUser.id &&
+            msg.info.routedHandoff?.status === "pending",
+        )
+        .map((msg) => msg.info)
+      const handoffIDs = new Set(pending.map((msg) => msg.routedHandoff?.id))
+      if (lastUser.routedHandoff?.status === "pending") handoffIDs.add(lastUser.routedHandoff.id)
+      if (handoffIDs.size === 0) return
+      if (lastUser.routedHandoff && handoffIDs.has(lastUser.routedHandoff.id)) {
+        lastUser.routedHandoff = undefined
+        yield* sessions.updateMessage(lastUser)
+      }
+      for (const assistant of pending) {
+        assistant.routedHandoff = undefined
+        yield* sessions.updateMessage(assistant)
+      }
+    })
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
@@ -151,6 +204,7 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
+      yield* Effect.uninterruptible(discardPendingHandoff(sessionID))
       yield* state.cancel(sessionID)
     })
 
@@ -651,7 +705,10 @@ const layer = Layer.effect(
               .getModel(model.providerID, model.modelID)
               .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
           : undefined
-      const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
+      const variant =
+        input.variant ??
+        ("variant" in model && typeof model.variant === "string" ? model.variant : undefined) ??
+        (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
 
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
@@ -667,25 +724,6 @@ const layer = Layer.effect(
         },
         system: input.system,
         format: input.format,
-      }
-
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      if (
-        current.agent !== info.agent ||
-        current.model?.providerID !== info.model.providerID ||
-        current.model?.id !== info.model.modelID ||
-        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
-      ) {
-        yield* sessions.setAgentModel({
-          sessionID: input.sessionID,
-          agent: info.agent,
-          model: {
-            id: info.model.modelID,
-            providerID: info.model.providerID,
-            variant: info.model.variant ?? "default",
-          },
-          time: info.time.created,
-        })
       }
 
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
@@ -1008,6 +1046,26 @@ const layer = Layer.effect(
         { message: info, parts: resolvedParts },
       )
 
+      info.model.variant = info.model.variant === "default" ? undefined : info.model.variant
+      const updated = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      if (
+        updated.agent !== info.agent ||
+        updated.model?.providerID !== info.model.providerID ||
+        updated.model?.id !== info.model.modelID ||
+        (updated.model?.variant === "default" ? undefined : updated.model?.variant) !== info.model.variant
+      ) {
+        yield* sessions.setAgentModel({
+          sessionID: input.sessionID,
+          agent: info.agent,
+          model: {
+            id: info.model.modelID,
+            providerID: info.model.providerID,
+            variant: info.model.variant ?? "default",
+          },
+          time: info.time.created,
+        })
+      }
+
       const parts = yield* Effect.forEach(resolvedParts, (part) =>
         part.type === "file" && part.mime.startsWith("image/")
           ? image.normalize(part).pipe(
@@ -1083,7 +1141,99 @@ const layer = Layer.effect(
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
+        let liveHandoffID: string | undefined
+        let deferredHandoffTasks: Array<SessionV1.CompactionPart | SessionV1.SubtaskPart> | undefined
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        const toolSummary = Effect.fn("SessionPrompt.toolSummary")(function* (messageID: MessageID) {
+          const observedTools = { pending: 0, running: 0, interrupted: 0, errored: 0, completed: 0 }
+          const parts = yield* MessageV2.parts(messageID).pipe(Effect.provideService(Database.Service, database))
+          for (const part of parts) {
+            if (part.type !== "tool") continue
+            if (part.state.status === "pending") observedTools.pending++
+            if (part.state.status === "running") observedTools.running++
+            if (part.state.status === "completed") observedTools.completed++
+            if (part.state.status === "error") {
+              if (part.state.metadata?.interrupted === true) observedTools.interrupted++
+              else observedTools.errored++
+            }
+          }
+          return observedTools
+        })
+        const overflowMinimum = Effect.fn("SessionPrompt.overflowMinimum")(function* (
+          messages: unknown,
+          model: Provider.Model,
+        ) {
+          const cfg = yield* config.get()
+          return yield* overflowMinimumEstimate(messages, () =>
+            usable({ cfg, model, outputTokenMax: flags.outputTokenMax }),
+          )
+        })
+
+        const overflowFallback = Effect.fn("SessionPrompt.overflowFallback")(function* (
+          user: SessionV1.User,
+          observedTools: { pending: number; running: number; interrupted: number; errored: number; completed: number },
+          input: { messages: unknown; model: Provider.Model } | undefined,
+        ) {
+          const decision = yield* plugin
+            .triggerProviderFailure({
+              sessionID,
+              userMessageID: user.id,
+              agent: user.agent,
+              model: { ...user.model },
+              failure: "overflow",
+              observedTools,
+            })
+            .pipe(Effect.catch(() => Effect.succeed({ action: "stop" as const, models: [] })))
+          if (decision.action === "stop") return "stop" as const
+          if (decision.action !== "fallback") return undefined
+          if (decision.models.length === 0) return undefined
+          if (!input) return undefined
+          const minContextTokens = yield* overflowMinimum(input.messages, input.model)
+          if (minContextTokens === undefined) return undefined
+          const proposed = validateFallbackCandidates(user.model, decision.models)
+          if (!proposed) return "invalid" as const
+          const cfg = yield* config.get()
+          const checked = yield* Effect.forEach(proposed, (candidate) =>
+            Effect.gen(function* () {
+              const model = yield* provider
+                .getModel(ProviderV2.ID.make(candidate.providerID), ModelV2.ID.make(candidate.modelID))
+                .pipe(Effect.option)
+              if (Option.isNone(model) || (candidate.variant && !model.value.variants?.[candidate.variant]))
+                return "invalid" as const
+              const capacity = usable({ cfg, model: model.value, outputTokenMax: flags.outputTokenMax })
+              return capacity > minContextTokens
+                ? {
+                    providerID: ProviderV2.ID.make(candidate.providerID),
+                    modelID: ModelV2.ID.make(candidate.modelID),
+                    ...(candidate.variant ? { variant: candidate.variant } : {}),
+                  }
+                : undefined
+            }),
+          )
+          if (checked.some((candidate) => candidate === "invalid")) return "invalid" as const
+          return checked.find((candidate) => candidate !== undefined)
+        })
+
+        const markProviderOverflow = Effect.fn("SessionPrompt.markProviderOverflow")(function* (
+          message: SessionV1.Assistant,
+        ) {
+          if (message.finish) return
+          message.error = new NamedError.Unknown({ message: "Routed provider failure: context overflow" }).toObject()
+          message.finish = "error"
+          yield* sessions.updateMessage(message)
+        })
+
+        const persistHandoffModel = (agent: string, next: SessionV1.User["model"]) =>
+          sessions.setAgentModel({
+            sessionID,
+            agent,
+            model: {
+              id: next.modelID,
+              providerID: next.providerID,
+              ...(next.variant !== undefined ? { variant: next.variant } : {}),
+            },
+            time: Date.now(),
+          })
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1096,6 +1246,186 @@ const layer = Layer.effect(
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          let handoff = lastUser.routedHandoff
+          const failedMarker =
+            !handoff &&
+            lastAssistant?.parentID === lastUser.id &&
+            lastAssistant.routedHandoff?.status === "pending" &&
+            lastAssistant.routedHandoff.userMessageID === lastUser.id
+              ? lastAssistant.routedHandoff
+              : undefined
+          if (failedMarker) {
+            handoff = failedMarker
+            lastUser.routedHandoff = failedMarker
+            lastUser.model = failedMarker.next
+            yield* sessions.updateMessage(lastUser)
+            yield* sessions.setAgentModel({
+              sessionID,
+              agent: lastUser.agent,
+              model: {
+                id: failedMarker.next.modelID,
+                providerID: failedMarker.next.providerID,
+                ...(failedMarker.next.variant ? { variant: failedMarker.next.variant } : {}),
+              },
+              time: Date.now(),
+            })
+          }
+          if (handoff && handoff.userMessageID !== lastUser.id) {
+            if (lastAssistant?.parentID === lastUser.id) {
+              lastAssistant.error = new NamedError.Unknown({ message: "routed handoff invariant" }).toObject()
+              lastAssistant.finish = "error"
+              lastAssistant.time.completed = Date.now()
+              yield* sessions.updateMessage(lastAssistant)
+            }
+            break
+          }
+          const handoffID = handoff?.id
+          const taggedSuccessor = handoffID
+            ? msgs.findLast(
+                (msg) =>
+                  msg.info.role === "assistant" &&
+                  msg.info.parentID === lastUser.id &&
+                  msg.info.routedHandoffID === handoffID,
+              )
+            : undefined
+          const activeHandoff = handoff?.status === "pending" && !taggedSuccessor
+          if (activeHandoff && handoff) {
+            lastUser.model = handoff.next
+            yield* sessions.updateMessage(lastUser)
+            yield* sessions.setAgentModel({
+              sessionID,
+              agent: lastUser.agent,
+              model: {
+                id: handoff.next.modelID,
+                providerID: handoff.next.providerID,
+                ...(handoff.next.variant ? { variant: handoff.next.variant } : {}),
+              },
+              time: Date.now(),
+            })
+          }
+          const failedAssistant = handoffID
+            ? msgs.findLast(
+                (msg) =>
+                  msg.info.role === "assistant" &&
+                  msg.info.parentID === lastUser.id &&
+                  msg.info.routedHandoff?.id === handoffID,
+              )
+            : undefined
+          if (activeHandoff && failedAssistant) {
+            deferredHandoffTasks ??= msgs
+              .find((msg) => msg.info.id === lastUser.id)
+              ?.parts.filter(
+                (part): part is SessionV1.CompactionPart | SessionV1.SubtaskPart =>
+                  (part.type === "subtask" &&
+                    !msgs.some(
+                      (msg) =>
+                        msg.info.role === "assistant" &&
+                        msg.info.parentID === lastUser.id &&
+                        msg.info.id < failedAssistant.info.id &&
+                        msg.info.agent === part.agent,
+                    )) ||
+                  (part.type === "compaction" &&
+                    !msgs.some(
+                      (msg) =>
+                        msg.info.role === "assistant" &&
+                        msg.info.parentID === lastUser.id &&
+                        msg.info.id < failedAssistant.info.id &&
+                        msg.info.summary,
+                    )),
+              )
+          }
+          if (
+            activeHandoff &&
+            failedAssistant &&
+            lastAssistant?.parentID === lastUser.id &&
+            lastAssistant.id !== failedAssistant?.info.id
+          ) {
+            lastAssistant.error = new NamedError.Unknown({ message: "routed handoff invariant" }).toObject()
+            lastAssistant.finish = "error"
+            lastAssistant.time.completed = Date.now()
+            yield* sessions.updateMessage(lastAssistant)
+            break
+          }
+          if (handoff && handoff.userMessageID === lastUser.id && taggedSuccessor?.info.role === "assistant") {
+            const tagged = taggedSuccessor.info
+            if (handoff.status === "pending") {
+              handoff = { ...handoff, status: "applied" }
+              lastUser.routedHandoff = handoff
+              yield* sessions.updateMessage(lastUser)
+              for (const failed of msgs) {
+                if (failed.info.role !== "assistant" || failed.info.routedHandoff?.id !== handoff.id) continue
+                failed.info.routedHandoff = { ...failed.info.routedHandoff, status: "applied" }
+                yield* sessions.updateMessage(failed.info)
+              }
+            }
+            const openTail = msgs.some(
+              (msg) =>
+                msg.info.role === "assistant" &&
+                msg.info.parentID === lastUser.id &&
+                msg.info.id > tagged.id &&
+                !msg.info.time.completed,
+            )
+            if (
+              liveHandoffID !== handoff.id &&
+              openTail &&
+              tagged.time.completed &&
+              !tagged.error &&
+              tagged.finish &&
+              tagged.finish !== "tool-calls"
+            ) {
+              for (const msg of msgs) {
+                if (msg.info.role !== "assistant" || msg.info.parentID !== lastUser.id || msg.info.id <= tagged.id)
+                  continue
+                if (msg.info.time.completed) continue
+                msg.info.error ??= new NamedError.Unknown({ message: "routed handoff interrupted" }).toObject()
+                msg.info.finish ??= "error"
+                msg.info.time.completed = Date.now()
+                yield* sessions.updateMessage(msg.info)
+              }
+              break
+            }
+            if (
+              liveHandoffID !== handoff.id &&
+              (!tagged.time.completed || tagged.error || !tagged.finish || tagged.finish === "tool-calls")
+            ) {
+              for (const msg of msgs) {
+                if (msg.info.role !== "assistant" || msg.info.parentID !== lastUser.id || msg.info.id <= tagged.id)
+                  continue
+                if (msg.info.time.completed) continue
+                msg.info.error ??= new NamedError.Unknown({ message: "routed handoff interrupted" }).toObject()
+                msg.info.finish ??= "error"
+                msg.info.time.completed = Date.now()
+                yield* sessions.updateMessage(msg.info)
+              }
+              if (tagged.time.completed && tagged.error) break
+              tagged.error = new NamedError.Unknown({ message: "routed handoff interrupted" }).toObject()
+              tagged.finish = "error"
+              tagged.time.completed = Date.now()
+              yield* sessions.updateMessage(tagged)
+              break
+            }
+            if (tagged.time.completed && tagged.finish !== "tool-calls") liveHandoffID = undefined
+            if (
+              liveHandoffID === handoff.id &&
+              lastAssistant &&
+              lastAssistant?.id > tagged.id &&
+              lastAssistant.time.completed &&
+              lastAssistant.finish !== "tool-calls"
+            ) {
+              liveHandoffID = undefined
+            }
+          }
+          if (handoff?.status === "applied" && handoff.userMessageID === lastUser.id && !taggedSuccessor) {
+            const target = lastAssistant && lastAssistant.parentID === lastUser.id ? lastAssistant : undefined
+            if (target) {
+              target.error = new NamedError.Unknown({ message: "routed handoff invariant" }).toObject()
+              target.finish = "error"
+              target.time.completed = Date.now()
+              yield* sessions.updateMessage(target)
+            }
+            break
+          }
+          const pendingHandoff = activeHandoff ? handoff : undefined
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1112,6 +1442,9 @@ const layer = Layer.effect(
             lastAssistant?.finish &&
             !["tool-calls"].includes(lastAssistant.finish) &&
             !hasToolCalls &&
+            !pendingHandoff &&
+            tasks.length === 0 &&
+            !deferredHandoffTasks?.length &&
             lastUser.id < lastAssistant.id
           ) {
             const orphan = lastAssistantMsg?.parts.find(
@@ -1138,8 +1471,89 @@ const layer = Layer.effect(
               history: msgs,
             }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-          const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
-          const task = tasks.pop()
+          const modelExit = yield* provider
+            .getModel(lastUser.model.providerID, lastUser.model.modelID)
+            .pipe(Effect.exit)
+          let model: Provider.Model
+          if (Exit.isSuccess(modelExit)) {
+            model = modelExit.value
+          } else {
+            const error = Cause.squash(modelExit.cause)
+            if (!Provider.ModelNotFoundError.isInstance(error)) return yield* Effect.die(error)
+            const decision = yield* plugin
+              .triggerProviderFailure({
+                sessionID,
+                userMessageID: lastUser.id,
+                agent: lastUser.agent,
+                model: {
+                  providerID: lastUser.model.providerID,
+                  modelID: lastUser.model.modelID,
+                  ...(lastUser.model.variant ? { variant: lastUser.model.variant } : {}),
+                },
+                failure: "config_model",
+                observedTools: { pending: 0, running: 0, interrupted: 0, errored: 0, completed: 0 },
+              })
+              .pipe(Effect.catch(() => Effect.succeed({ action: "stop" as const, models: [] })))
+            if (decision.action === "unhandled") {
+              const hint = error.suggestions?.length ? ` Did you mean: ${error.suggestions.join(", ")}?` : ""
+              yield* events.publish(Session.Event.Error, {
+                sessionID,
+                error: new NamedError.Unknown({
+                  message: `Model not found: ${error.providerID}/${error.modelID}.${hint}`,
+                }).toObject(),
+              })
+              return yield* Effect.die(error)
+            }
+            const stop = Effect.fn("SessionPrompt.configModelStop")(function* (message: string) {
+              yield* events.publish(Session.Event.Error, {
+                sessionID,
+                error: new NamedError.Unknown({ message }).toObject(),
+              })
+            })
+            if (decision.action === "stop") {
+              yield* stop("Routed config/model failure: routing stopped")
+              break
+            }
+            const proposed = validateFallbackCandidates(lastUser.model, decision.models)
+            if (!proposed) {
+              yield* stop("Routed config/model failure: invalid fallback proposal")
+              break
+            }
+            const candidates = yield* Effect.forEach(proposed, (candidate) =>
+              Effect.gen(function* () {
+                const resolved = yield* provider
+                  .getModel(ProviderV2.ID.make(candidate.providerID), ModelV2.ID.make(candidate.modelID))
+                  .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
+                if (!resolved || (candidate.variant && !resolved.variants?.[candidate.variant])) return
+                return {
+                  providerID: ProviderV2.ID.make(candidate.providerID),
+                  modelID: ModelV2.ID.make(candidate.modelID),
+                  ...(candidate.variant ? { variant: candidate.variant } : {}),
+                }
+              }),
+            )
+            if (candidates.some((candidate) => candidate === undefined)) {
+              yield* stop("Routed config/model failure: invalid fallback proposal")
+              break
+            }
+            const next = candidates[0]!
+            lastUser.routedHandoff = {
+              id: `handoff_${PartID.ascending()}`,
+              status: "pending",
+              failure: "config_model",
+              from: { ...lastUser.model },
+              next,
+              userMessageID: lastUser.id,
+            }
+            lastUser.model = next
+            yield* sessions.updateMessage(lastUser)
+            yield* persistHandoffModel(lastUser.agent, next)
+            continue
+          }
+          const task =
+            pendingHandoff || (handoffID !== undefined && liveHandoffID === handoffID)
+              ? undefined
+              : (deferredHandoffTasks?.pop() ?? tasks.pop())
 
           if (task?.type === "subtask") {
             yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
@@ -1159,11 +1573,63 @@ const layer = Layer.effect(
           }
 
           if (
+            !pendingHandoff &&
             lastFinished &&
             lastFinished.summary !== true &&
             (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
           ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+            const request = yield* MessageV2.toModelMessagesEffect(msgs, model).pipe(Effect.option)
+            const observedTools = yield* toolSummary(lastFinished.id)
+            const next = yield* overflowFallback(
+              lastUser,
+              observedTools,
+              Option.isSome(request) ? { messages: request.value, model } : undefined,
+            )
+            if (next === "invalid") {
+              const error = new NamedError.Unknown({
+                message: "Routed overflow failure: invalid fallback proposal",
+              }).toObject()
+              yield* events.publish(Session.Event.Error, { sessionID, error })
+              break
+            }
+            if (next === "stop") {
+              const error = new NamedError.Unknown({ message: "Routed overflow failure: routing stopped" }).toObject()
+              yield* events.publish(Session.Event.Error, { sessionID, error })
+              break
+            }
+            if (next) {
+              if (
+                observedTools.pending ||
+                observedTools.running ||
+                observedTools.interrupted ||
+                observedTools.errored
+              ) {
+                const error = new NamedError.Unknown({
+                  message: "Routed overflow failure: tool state is indeterminate",
+                }).toObject()
+                yield* events.publish(Session.Event.Error, { sessionID, error })
+                break
+              }
+              lastUser.routedHandoff = {
+                id: `handoff_${PartID.ascending()}`,
+                status: "pending",
+                failure: "overflow",
+                from: { ...lastUser.model },
+                next,
+                userMessageID: lastUser.id,
+              }
+              lastUser.model = next
+              yield* sessions.updateMessage(lastUser)
+              yield* persistHandoffModel(lastUser.agent, next)
+              continue
+            }
+            yield* compaction.create({
+              sessionID,
+              agent: lastUser.agent,
+              model: lastUser.model,
+              auto: true,
+              overflow: false,
+            })
             continue
           }
 
@@ -1197,8 +1663,20 @@ const layer = Layer.effect(
             providerID: model.providerID,
             time: { created: Date.now() },
             sessionID,
+            ...(pendingHandoff ? { routedHandoffID: pendingHandoff.id } : {}),
           }
           yield* sessions.updateMessage(msg)
+
+          if (pendingHandoff) {
+            lastUser.routedHandoff = { ...pendingHandoff, status: "applied" }
+            yield* sessions.updateMessage(lastUser)
+            for (const failed of msgs) {
+              if (failed.info.role !== "assistant" || failed.info.routedHandoff?.id !== pendingHandoff.id) continue
+              failed.info.routedHandoff = { ...failed.info.routedHandoff, status: "applied" }
+              yield* sessions.updateMessage(failed.info)
+            }
+            liveHandoffID = pendingHandoff.id
+          }
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
             if (msg.time.completed) return
@@ -1215,6 +1693,7 @@ const layer = Layer.effect(
               assistantMessage: msg,
               sessionID,
               model,
+              provider,
             })
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
@@ -1269,6 +1748,10 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            const request = [
+              ...modelMsgs,
+              ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+            ]
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1276,14 +1759,34 @@ const layer = Layer.effect(
               sessionID,
               parentSessionID: session.parentID,
               system,
-              messages: [
-                ...modelMsgs,
-                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-              ],
+              messages: request,
               tools,
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
+
+            if (typeof result === "object" && result.type === "handoff") {
+              const handoff = handle.message.routedHandoff
+              if (!handoff || handoff.id !== result.handoffID || handoff.userMessageID !== lastUser.id) {
+                handle.message.error = new NamedError.Unknown({ message: "routed handoff invariant" }).toObject()
+                yield* sessions.updateMessage(handle.message)
+                return "break" as const
+              }
+              lastUser.routedHandoff = handoff
+              lastUser.model = handoff.next
+              yield* sessions.updateMessage(lastUser)
+              yield* sessions.setAgentModel({
+                sessionID,
+                agent: lastUser.agent,
+                model: {
+                  id: handoff.next.modelID,
+                  providerID: handoff.next.providerID,
+                  ...(handoff.next.variant ? { variant: handoff.next.variant } : {}),
+                },
+                time: Date.now(),
+              })
+              return "continue" as const
+            }
 
             if (structured !== undefined) {
               handle.message.structured = structured
@@ -1316,14 +1819,172 @@ const layer = Layer.effect(
               }
             }
 
+            if (
+              handle.message.finish &&
+              !["tool-calls", "unknown", "content-filter"].includes(handle.message.finish) &&
+              !handle.message.error
+            ) {
+              const parts = yield* MessageV2.parts(handle.message.id).pipe(
+                Effect.provideService(Database.Service, database),
+              )
+              if (isProtocolEmpty(parts)) {
+                const decision = yield* plugin
+                  .triggerProviderFailure({
+                    sessionID,
+                    userMessageID: lastUser.id,
+                    agent: lastUser.agent,
+                    model: {
+                      providerID: lastUser.model.providerID,
+                      modelID: lastUser.model.modelID,
+                      ...(lastUser.model.variant ? { variant: lastUser.model.variant } : {}),
+                    },
+                    failure: "protocol_empty",
+                    observedTools: { pending: 0, running: 0, interrupted: 0, errored: 0, completed: 0 },
+                  })
+                  .pipe(Effect.catch(() => Effect.succeed({ action: "stop" as const, models: [] })))
+                if (decision.action === "stop") {
+                  handle.message.error = new NamedError.Unknown({
+                    message: "Routed empty-response failure: routing stopped",
+                  }).toObject()
+                  yield* sessions.updateMessage(handle.message)
+                  yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+                  return "break" as const
+                }
+                if (decision.action === "fallback") {
+                  const proposed = validateFallbackCandidates(
+                    {
+                      providerID: lastUser.model.providerID,
+                      modelID: lastUser.model.modelID,
+                      ...(lastUser.model.variant ? { variant: lastUser.model.variant } : {}),
+                    },
+                    decision.models,
+                  )
+                  if (!proposed) {
+                    handle.message.error = new NamedError.Unknown({
+                      message: "Routed empty-response failure: invalid fallback proposal",
+                    }).toObject()
+                    yield* sessions.updateMessage(handle.message)
+                    yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+                    return "break" as const
+                  }
+                  const candidates = yield* Effect.forEach(proposed, (candidate) =>
+                    Effect.gen(function* () {
+                      const resolved = yield* provider
+                        .getModel(ProviderV2.ID.make(candidate.providerID), ModelV2.ID.make(candidate.modelID))
+                        .pipe(Effect.option)
+                      if (
+                        Option.isNone(resolved) ||
+                        (candidate.variant && !resolved.value.variants?.[candidate.variant])
+                      )
+                        return
+                      return {
+                        providerID: ProviderV2.ID.make(candidate.providerID),
+                        modelID: ModelV2.ID.make(candidate.modelID),
+                        ...(candidate.variant ? { variant: candidate.variant } : {}),
+                      }
+                    }),
+                  )
+                  if (candidates.some((candidate) => candidate === undefined)) {
+                    handle.message.error = new NamedError.Unknown({
+                      message: "Routed empty-response failure: invalid fallback proposal",
+                    }).toObject()
+                    yield* sessions.updateMessage(handle.message)
+                    yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+                    return "break" as const
+                  }
+                  const next = candidates[0]!
+                  const handoff = {
+                    id: `handoff_${PartID.ascending()}`,
+                    status: "pending" as const,
+                    failure: "protocol_empty" as const,
+                    from: { ...lastUser.model },
+                    next,
+                    userMessageID: lastUser.id,
+                  }
+                  handle.message.error = new NamedError.Unknown({
+                    message: "Routed provider failure: empty response",
+                  }).toObject()
+                  handle.message.finish = "error"
+                  handle.message.routedHandoff = handoff
+                  yield* sessions.updateMessage(handle.message)
+                  lastUser.routedHandoff = handoff
+                  lastUser.model = next
+                  yield* sessions.updateMessage(lastUser)
+                  yield* persistHandoffModel(lastUser.agent, next)
+                  return "continue" as const
+                }
+              }
+            }
+
             if (result === "stop") return "break" as const
             if (result === "compact") {
+              const observedTools = yield* toolSummary(handle.message.id)
+              const next = yield* overflowFallback(lastUser, observedTools, { messages: request, model })
+              if (next === "invalid") {
+                if (!handle.message.finish) {
+                  handle.message.error = new NamedError.Unknown({
+                    message: "Routed overflow failure: invalid fallback proposal",
+                  }).toObject()
+                  handle.message.finish = "error"
+                  yield* sessions.updateMessage(handle.message)
+                }
+                const error = new NamedError.Unknown({
+                  message: "Routed overflow failure: invalid fallback proposal",
+                }).toObject()
+                yield* events.publish(Session.Event.Error, { sessionID, error })
+                return "break" as const
+              }
+              if (next === "stop") {
+                handle.message.error = new NamedError.Unknown({
+                  message: "Routed overflow failure: routing stopped",
+                }).toObject()
+                handle.message.finish = "error"
+                yield* sessions.updateMessage(handle.message)
+                yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+                return "break" as const
+              }
+              if (next) {
+                if (
+                  observedTools.pending ||
+                  observedTools.running ||
+                  observedTools.interrupted ||
+                  observedTools.errored
+                ) {
+                  handle.message.error = new NamedError.Unknown({
+                    message: "Routed overflow failure: tool state is indeterminate",
+                  }).toObject()
+                  handle.message.finish = "error"
+                  yield* sessions.updateMessage(handle.message)
+                  yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+                  return "break" as const
+                }
+                const handoff = {
+                  id: `handoff_${PartID.ascending()}`,
+                  status: "pending" as const,
+                  failure: "overflow" as const,
+                  from: { ...lastUser.model },
+                  next,
+                  userMessageID: lastUser.id,
+                }
+                if (!handle.message.finish) {
+                  yield* markProviderOverflow(handle.message)
+                  handle.message.routedHandoff = handoff
+                  yield* sessions.updateMessage(handle.message)
+                }
+                lastUser.routedHandoff = handoff
+                lastUser.model = next
+                yield* sessions.updateMessage(lastUser)
+                yield* persistHandoffModel(lastUser.agent, next)
+                return "continue" as const
+              }
+              const overflow = !handle.message.finish
+              yield* markProviderOverflow(handle.message)
               yield* compaction.create({
                 sessionID,
                 agent: lastUser.agent,
                 model: lastUser.model,
                 auto: true,
-                overflow: !handle.message.finish,
+                overflow,
               })
             }
             return "continue" as const
@@ -1343,7 +2004,13 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        runLoop(input.sessionID).pipe(
+          Effect.onInterrupt(() => Effect.uninterruptible(discardPendingHandoff(input.sessionID))),
+        ),
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(

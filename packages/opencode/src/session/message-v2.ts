@@ -243,10 +243,12 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
 
     if (msg.info.role === "assistant") {
       const differentModel = `${model.providerID}/${model.id}` !== `${msg.info.providerID}/${msg.info.modelID}`
+      const routedHandoff = msg.info.routedHandoff
       const media: Array<{ mime: string; url: string; filename?: string }> = []
 
       if (
         msg.info.error &&
+        !routedHandoff &&
         !(
           AbortedError.isInstance(msg.info.error) &&
           msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")
@@ -275,6 +277,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
         return part.metadata?.anthropic?.signature != null
       })
       for (const part of msg.parts) {
+        if (routedHandoff && (part.type !== "tool" || part.state.status !== "completed")) continue
         if (part.type === "text") {
           const text = part.text === "" && hasSignedReasoning ? " " : part.text
           assistantMessage.parts.push({

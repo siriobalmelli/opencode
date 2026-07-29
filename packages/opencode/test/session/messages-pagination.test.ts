@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Effect, Option } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
@@ -128,6 +128,86 @@ const addCompactionPart = Effect.fn("Test.addCompactionPart")(function* (
 })
 
 describe("MessageV2.page", () => {
+  it.instance("round-trips and replays optional routed handoff fields", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        const userID = MessageID.ascending()
+        const handoff = {
+          id: "handoff-1",
+          status: "pending" as const,
+          failure: "server" as const,
+          from: {
+            providerID: ProviderV2.ID.make("primary"),
+            modelID: ModelV2.ID.make("primary-model"),
+            variant: "primary",
+          },
+          next: {
+            providerID: ProviderV2.ID.make("fallback"),
+            modelID: ModelV2.ID.make("fallback-model"),
+            variant: "secondary",
+          },
+          userMessageID: userID,
+        }
+        const user = {
+          id: userID,
+          sessionID,
+          role: "user" as const,
+          time: { created: Date.now() },
+          agent: "test",
+          model: { providerID: ProviderV2.ID.make("primary"), modelID: ModelV2.ID.make("primary-model") },
+          tools: {},
+          routedHandoff: handoff,
+        } as unknown as SessionV1.User
+        const roundTrip = Schema.decodeUnknownSync(SessionV1.User)(Schema.encodeSync(SessionV1.User)(user))
+        expect(roundTrip.routedHandoff).toEqual(handoff)
+        const decodeUser = Schema.decodeUnknownSync(SessionV1.User)
+        for (const failure of [
+          "auth",
+          "rate_limit",
+          "server",
+          "network",
+          "protocol_empty",
+          "config_model",
+          "overflow",
+          "unknown",
+        ] as const) {
+          expect(decodeUser({ ...user, routedHandoff: { ...handoff, failure } }).routedHandoff?.failure).toBe(failure)
+        }
+        for (const failure of ["api", "context-overflow", "content-filter", "output-length"]) {
+          expect(() => decodeUser({ ...user, routedHandoff: { ...handoff, failure } })).toThrow()
+        }
+
+        const assistantID = MessageID.ascending()
+        const assistant = {
+          id: assistantID,
+          sessionID,
+          role: "assistant" as const,
+          time: { created: Date.now() },
+          parentID: userID,
+          modelID: ModelV2.ID.make("primary-model"),
+          providerID: ProviderV2.ID.make("primary"),
+          mode: "",
+          agent: "test",
+          path: { cwd: "/", root: "/" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          routedHandoff: handoff,
+          routedHandoffID: handoff.id,
+        } as unknown as SessionV1.Assistant
+
+        yield* session.updateMessage(user)
+        yield* session.updateMessage(assistant)
+
+        const replayedUser = yield* MessageV2.get({ sessionID, messageID: userID })
+        const replayedAssistant = yield* MessageV2.get({ sessionID, messageID: assistantID })
+        expect(replayedUser.info.routedHandoff).toEqual(handoff)
+        expect(replayedAssistant.info.routedHandoff).toEqual(handoff)
+        expect(replayedAssistant.info.role).toBe("assistant")
+        if (replayedAssistant.info.role === "assistant") expect(replayedAssistant.info.routedHandoffID).toBe(handoff.id)
+      }),
+    ),
+  )
+
   it.instance("returns page result", () =>
     withSession(({ sessionID }) =>
       Effect.gen(function* () {

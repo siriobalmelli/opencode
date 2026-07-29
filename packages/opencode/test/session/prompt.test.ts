@@ -8,7 +8,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
-import { fileURLToPath } from "url"
+import { fileURLToPath, pathToFileURL } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -34,7 +34,7 @@ import { SessionCompaction } from "../../src/session/compaction"
 import { SessionSummary } from "../../src/session/summary"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
-import { SessionPrompt } from "../../src/session/prompt"
+import { overflowMinimumEstimate, SessionPrompt } from "../../src/session/prompt"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -157,10 +157,15 @@ const lsp = Layer.succeed(
 )
 
 const processorCreateStarted: Array<() => void> = []
+const processorModels: Array<Parameters<SessionProcessor.Interface["create"]>[0]["model"]> = []
 const blockingProcessor = Layer.succeed(
   SessionProcessor.Service,
   SessionProcessor.Service.of({
-    create: () => Effect.sync(() => processorCreateStarted.shift()?.()).pipe(Effect.andThen(Effect.never)),
+    create: (input) =>
+      Effect.sync(() => {
+        processorModels.push(input.model)
+        processorCreateStarted.shift()?.()
+      }).pipe(Effect.andThen(Effect.never)),
   }),
 )
 
@@ -240,8 +245,41 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 }
 
 const it = testEffect(makeHttp())
+const overflow = it
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
+const overflowCompactionCalls = new Map<SessionID, Array<Parameters<SessionCompaction.Interface["create"]>[0]>>()
+const overflowCompactions = (sessionID: SessionID) => overflowCompactionCalls.get(sessionID) ?? []
+const overflowCompactionSpy = Layer.succeed(
+  SessionCompaction.Service,
+  SessionCompaction.Service.of({
+    isOverflow: () => Effect.succeed(true),
+    prune: () => Effect.void,
+    process: () => Effect.succeed("continue"),
+    create: (input) =>
+      Effect.sync(() => {
+        overflowCompactionCalls.set(input.sessionID, [...overflowCompactions(input.sessionID), input])
+      }).pipe(Effect.andThen(Effect.die("overflow compaction created"))),
+  }),
+)
+const overflowHarness = testEffect(
+  LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [SessionCompaction.node, overflowCompactionSpy],
+  ]),
+)
+const cappedOverflowHarness = testEffect(
+  LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true, outputTokenMax: 5 })],
+    [SessionCompaction.node, overflowCompactionSpy],
+  ]),
+)
 const withMcpInstructions = testEffect(
   makeHttp({
     mcpInstructions: [
@@ -255,6 +293,19 @@ const withMcpInstructions = testEffect(
 )
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
+
+noLLMServer.effect("overflow minimum stringify defects succeed with no estimate", () =>
+  Effect.gen(function* () {
+    const messages: { self?: unknown } = {}
+    messages.self = messages
+    expect(yield* overflowMinimumEstimate(messages, () => 100)).toBeUndefined()
+    expect(
+      yield* overflowMinimumEstimate([], () => {
+        throw new Error("unavailable capacity")
+      }),
+    ).toBeUndefined()
+  }),
+)
 
 // Config that registers a custom "test" provider with a "test-model" model
 // so provider model lookup succeeds inside the loop.
@@ -287,6 +338,75 @@ const cfg = {
   },
 }
 
+const routedCfg = {
+  ...cfg,
+  provider: {
+    ...cfg.provider,
+    fallback: {
+      ...cfg.provider.test,
+      id: "fallback",
+      name: "Fallback",
+      models: {
+        "fallback-model": { ...cfg.provider.test.models["test-model"], id: "fallback-model", name: "Fallback Model" },
+      },
+      options: { ...cfg.provider.test.options },
+    },
+  },
+}
+
+const routedNoHttpCfg = {
+  ...routedCfg,
+  provider: {
+    ...routedCfg.provider,
+    fallback: {
+      ...routedCfg.provider.fallback,
+      models: {
+        "fallback-model": {
+          ...cfg.provider.test.models["test-model"],
+          id: "fallback-model",
+          reasoning: true,
+          variants: { high: {} },
+        },
+        "second-model": {
+          ...cfg.provider.test.models["test-model"],
+          id: "second-model",
+          reasoning: true,
+        },
+      },
+    },
+  },
+}
+
+function overflowProviderCfg(url: string) {
+  const model = cfg.provider.test.models["test-model"]
+  return {
+    ...routedProviderCfg(url),
+    compaction: { reserved: 20 },
+    provider: {
+      ...routedProviderCfg(url).provider,
+      test: {
+        ...routedProviderCfg(url).provider.test,
+        models: {
+          "test-model": { ...model, limit: { context: 120, output: 20 } },
+        },
+      },
+      fallback: {
+        ...routedProviderCfg(url).provider.fallback,
+        models: {
+          "fallback-small": { ...model, id: "fallback-small", limit: { context: 80, output: 20 } },
+          "fallback-bound": { ...model, id: "fallback-bound", limit: { context: 120, output: 20 } },
+          "fallback-large": {
+            ...model,
+            id: "fallback-large",
+            limit: { context: 240, output: 20 },
+            variants: { high: {} },
+          },
+        },
+      },
+    },
+  }
+}
+
 function providerCfg(url: string) {
   return {
     ...cfg,
@@ -303,10 +423,95 @@ function providerCfg(url: string) {
   }
 }
 
+function routedProviderCfg(url: string) {
+  return {
+    ...providerCfg(url),
+    agent: { build: { model: "test/test-model" } },
+    provider: {
+      ...providerCfg(url).provider,
+      fallback: {
+        ...cfg.provider.test,
+        id: "fallback",
+        name: "Fallback",
+        models: {
+          "fallback-model": { ...cfg.provider.test.models["test-model"], id: "fallback-model", name: "Fallback Model" },
+        },
+        options: { ...cfg.provider.test.options, baseURL: url },
+      },
+    },
+  }
+}
+
+function stickyProviderCfg(url: string) {
+  return {
+    ...routedProviderCfg(url),
+    agent: {
+      ...routedProviderCfg(url).agent,
+      sticky: { description: "Test agent without a configured model" },
+    },
+    provider: {
+      ...routedProviderCfg(url).provider,
+      fallback: {
+        ...routedProviderCfg(url).provider.fallback,
+        models: {
+          "fallback-model": {
+            ...cfg.provider.test.models["test-model"],
+            id: "fallback-model",
+            variants: { high: {} },
+          },
+        },
+      },
+    },
+  }
+}
+
 const writeText = Effect.fn("test.writeText")(function* (file: string, text: string) {
   const fs = yield* FSUtil.Service
   yield* fs.writeWithDirs(file, text)
 })
+
+function protocolEmptyCounterPlugin(counter: string) {
+  return [
+    "export default async () => ({",
+    '  "chat.provider.failure": async (input) => {',
+    '    if (input.failure !== "protocol_empty") return',
+    `    const file = Bun.file(${JSON.stringify(counter)})`,
+    "    const count = (await file.exists()) ? Number(await file.text()) : 0",
+    `    await Bun.write(${JSON.stringify(counter)}, String(count + 1))`,
+    "  },",
+    "})",
+  ].join("\n")
+}
+
+const protocolEmptyInvocationCount = (counter: string) =>
+  Effect.promise(() => Bun.file(counter).text()).pipe(Effect.map(Number))
+
+function overflowPlugin(input: { capture: string; action?: "fallback" | "stop"; models?: readonly unknown[] }) {
+  return [
+    "export default async () => ({",
+    '  "chat.provider.failure": async (input, output) => {',
+    '    if (input.failure !== "overflow") return',
+    `    await Bun.write(${JSON.stringify(input.capture)}, JSON.stringify(input))`,
+    ...(input.action ? [`    output.action = ${JSON.stringify(input.action)}`] : []),
+    ...(input.models ? [`    output.models.push(...${JSON.stringify(input.models)})`] : []),
+    "  },",
+    "})",
+  ].join("\n")
+}
+
+const chatMessageModelPlugin = [
+  "export default async () => {",
+  "  let routed = false",
+  "  return {",
+  '  "chat.message": (_input, output) => {',
+  "    if (routed) return",
+  "    routed = true",
+  '    output.message.agent = "sticky"',
+  '    output.message.model = { providerID: "fallback", modelID: "fallback-model", variant: "high" }',
+  "  },",
+  "  }",
+  "}",
+].join("\n")
 
 const writeConfig = Effect.fn("test.writeConfig")(function* (dir: string, config: Partial<ConfigV1.Info>) {
   yield* writeText(
@@ -319,6 +524,9 @@ const useServerConfig = Effect.fn("test.useServerConfig")(function* (config: (ur
   const { directory: dir } = yield* TestInstance
   const llm = yield* TestLLMServer
   yield* writeConfig(dir, config(llm.url))
+  const service = yield* Config.Service
+  yield* service.invalidate()
+  yield* service.get()
   return { dir, llm }
 })
 
@@ -417,6 +625,75 @@ const seed = Effect.fn("test.seed")(function* (sessionID: SessionID, opts?: { fi
   return { user: msg, assistant }
 })
 
+const routedHandoff = (userMessageID: MessageID, status: "pending" | "applied" = "pending") => ({
+  id: "handoff-test",
+  status,
+  failure: "rate_limit" as const,
+  from: ref,
+  next: { providerID: ProviderV2.ID.make("fallback"), modelID: ModelV2.ID.make("fallback-model") },
+  userMessageID,
+})
+
+const seedRoutedHandoff = Effect.fn("test.seedRoutedHandoff")(function* (
+  sessionID: SessionID,
+  input?: {
+    status?: "pending" | "applied"
+    tagged?: boolean
+    terminal?: boolean
+    cancelled?: boolean
+    differentTagged?: boolean
+    userMarker?: boolean
+    finish?: string
+    tail?: boolean
+  },
+) {
+  const sessions = yield* Session.Service
+  const seeded = yield* seed(sessionID, { finish: "error" })
+  const user = seeded.user as SessionV1.User
+  const handoff = routedHandoff(seeded.user.id, input?.status)
+  if (input?.userMarker !== false) {
+    user.routedHandoff = handoff
+    yield* sessions.updateMessage(user)
+  }
+  seeded.assistant.routedHandoff = handoff
+  yield* sessions.updateMessage(seeded.assistant)
+  if (input?.tagged) {
+    const successor: SessionV1.Assistant = {
+      ...seeded.assistant,
+      id: MessageID.ascending(),
+      modelID: handoff.next.modelID,
+      providerID: handoff.next.providerID,
+      routedHandoffID: input.differentTagged ? "different-handoff" : handoff.id,
+      time: { created: Date.now(), ...(input.terminal || input.cancelled ? { completed: Date.now() } : {}) },
+      ...(input.terminal
+        ? { finish: "stop" }
+        : {
+            finish: input.finish,
+            ...(input.cancelled
+              ? {
+                  error: MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+                    providerID: ref.providerID,
+                    aborted: true,
+                  }),
+                }
+              : { error: undefined }),
+          }),
+    }
+    yield* sessions.updateMessage(successor)
+    if (input.tail) {
+      yield* sessions.updateMessage({
+        ...successor,
+        id: MessageID.ascending(),
+        routedHandoffID: undefined,
+        time: { created: Date.now() },
+        finish: undefined,
+        error: undefined,
+      })
+    }
+  }
+  return { ...seeded, user, handoff }
+})
+
 const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
@@ -442,6 +719,246 @@ const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
   return { prompt, run, sessions, chat }
 })
 
+it.instance(
+  "persists chat.message model mutations on the user and session",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "sticky-model-plugin.ts")
+      yield* writeText(plugin, chatMessageModelPlugin)
+      const { llm } = yield* useServerConfig((url) => ({
+        ...stickyProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Sticky plugin model" })
+      const original = sessions.setAgentModel
+      let modelUpdates = 0
+      ;(sessions as { setAgentModel: typeof sessions.setAgentModel }).setAgentModel = (input) => {
+        modelUpdates++
+        return original(input)
+      }
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          ;(sessions as { setAgentModel: typeof sessions.setAgentModel }).setAgentModel = original
+        }),
+      )
+      const updates: Array<Session.Info["model"]> = []
+      const off = yield* events.listen((event) => {
+        if (event.type === Session.Event.Updated.type) {
+          const data = event.data as typeof Session.Event.Updated.data.Type
+          if (data.sessionID === chat.id) updates.push(data.info.model)
+        }
+        return Effect.void
+      })
+
+      const message = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "sticky",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "hello" }],
+      })
+      yield* off
+
+      expect(modelUpdates).toBe(1)
+      expect(updates.some((model) => model?.providerID === ref.providerID && model.id === ref.modelID)).toBe(false)
+      expect(message.info.role).toBe("user")
+      if (message.info.role === "user") {
+        expect(message.info.agent).toBe("sticky")
+        expect(message.info.model).toEqual({
+          providerID: ProviderV2.ID.make("fallback"),
+          modelID: ModelV2.ID.make("fallback-model"),
+          variant: "high",
+        })
+      }
+      expect(yield* sessions.get(chat.id)).toMatchObject({
+        agent: "sticky",
+        model: {
+          providerID: ProviderV2.ID.make("fallback"),
+          id: ModelV2.ID.make("fallback-model"),
+          variant: "high",
+        },
+      })
+      expect(yield* llm.hits).toHaveLength(0)
+    }),
+  10_000,
+)
+
+it.instance("uses the chat.message model mutation on the next implicit turn", () =>
+  Effect.gen(function* () {
+    const { directory } = yield* TestInstance
+    const plugin = path.join(directory, "sticky-next-turn-plugin.ts")
+    yield* writeText(plugin, chatMessageModelPlugin)
+    yield* useServerConfig((url) => ({ ...stickyProviderCfg(url), plugin: [pathToFileURL(plugin).href] }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Sticky next turn" })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "sticky",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "first" }],
+    })
+    const next = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "sticky",
+      noReply: true,
+      parts: [{ type: "text", text: "second" }],
+    })
+
+    expect(next.info.role).toBe("user")
+    if (next.info.role === "user") {
+      expect(next.info.model).toEqual({
+        providerID: ProviderV2.ID.make("fallback"),
+        modelID: ModelV2.ID.make("fallback-model"),
+        variant: "high",
+      })
+    }
+  }),
+)
+
+it.instance("uses the persisted chat.message model when history is unavailable", () =>
+  Effect.gen(function* () {
+    const { directory } = yield* TestInstance
+    const plugin = path.join(directory, "sticky-restart-plugin.ts")
+    yield* writeText(plugin, chatMessageModelPlugin)
+    yield* useServerConfig((url) => ({ ...stickyProviderCfg(url), plugin: [pathToFileURL(plugin).href] }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Sticky restart" })
+
+    const first = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "sticky",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "first" }],
+    })
+    yield* sessions.removeMessage({ sessionID: chat.id, messageID: first.info.id })
+    const next = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "sticky",
+      noReply: true,
+      parts: [{ type: "text", text: "after restart" }],
+    })
+
+    expect(next.info.role).toBe("user")
+    if (next.info.role === "user") {
+      expect(next.info.model).toEqual({
+        providerID: ProviderV2.ID.make("fallback"),
+        modelID: ModelV2.ID.make("fallback-model"),
+        variant: "high",
+      })
+    }
+  }),
+)
+
+it.instance("does not emit a redundant session update for an unchanged chat.message hook", () =>
+  Effect.gen(function* () {
+    const { directory } = yield* TestInstance
+    const plugin = path.join(directory, "unchanged-message-plugin.ts")
+    yield* writeText(plugin, 'export default async () => ({ "chat.message": () => {} })')
+    yield* useServerConfig((url) => ({ ...stickyProviderCfg(url), plugin: [pathToFileURL(plugin).href] }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const events = yield* EventV2Bridge.Service
+    const chat = yield* sessions.create({
+      title: "Unchanged plugin model",
+      agent: "sticky",
+      model: {
+        providerID: ProviderV2.ID.make("fallback"),
+        id: ModelV2.ID.make("fallback-model"),
+        variant: "high",
+      },
+    })
+    const original = sessions.setAgentModel
+    let updates = 0
+    ;(sessions as { setAgentModel: typeof sessions.setAgentModel }).setAgentModel = (input) => {
+      updates++
+      return original(input)
+    }
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        ;(sessions as { setAgentModel: typeof sessions.setAgentModel }).setAgentModel = original
+      }),
+    )
+    const modelUpdates: Session.Info["model"][] = []
+    const off = yield* events.listen((event) => {
+      if (event.type !== Session.Event.Updated.type) return Effect.void
+      const data = event.data as typeof Session.Event.Updated.data.Type
+      if (data.sessionID === chat.id) modelUpdates.push(data.info.model)
+      return Effect.void
+    })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "sticky",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* off
+
+    expect(updates).toBe(0)
+    expect(modelUpdates).toEqual([
+      { providerID: ProviderV2.ID.make("fallback"), id: ModelV2.ID.make("fallback-model"), variant: "high" },
+    ])
+  }),
+)
+
+it.instance("keeps the session model unchanged when no chat.message plugin is configured", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(stickyProviderCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "No plugin model",
+      agent: "sticky",
+      model: {
+        providerID: ProviderV2.ID.make("fallback"),
+        id: ModelV2.ID.make("fallback-model"),
+        variant: "high",
+      },
+    })
+
+    const message = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "sticky",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+
+    expect(message.info.role).toBe("user")
+    if (message.info.role === "user") {
+      expect(message.info.model).toEqual({
+        providerID: ProviderV2.ID.make("fallback"),
+        modelID: ModelV2.ID.make("fallback-model"),
+        variant: "high",
+      })
+    }
+    const explicit = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "sticky",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "explicit" }],
+    })
+
+    expect(explicit.info.role).toBe("user")
+    if (explicit.info.role === "user") expect(explicit.info.model).toEqual(ref)
+    expect((yield* sessions.get(chat.id)).model).toEqual({
+      providerID: ref.providerID,
+      id: ref.modelID,
+      variant: "default",
+    })
+    expect(yield* llm.hits).toHaveLength(0)
+  }),
+)
+
 // Loop semantics
 
 noLLMServer.instance(
@@ -459,6 +976,1853 @@ noLLMServer.instance(
     }),
   { config: cfg },
 )
+
+for (const [name, first] of [
+  ["empty terminal response", () => reply().stop()],
+  ["whitespace-only terminal response", () => reply().text(" \n\t ").stop()],
+  ["reasoning-only terminal response", () => reply().reason("internal").stop()],
+] as const) {
+  it.instance(
+    `routes ${name} to one tagged fallback successor`,
+    () =>
+      Effect.gen(function* () {
+        const { directory } = yield* TestInstance
+        const plugin = path.join(directory, "protocol-empty-fallback.ts")
+        yield* writeText(
+          plugin,
+          [
+            "export default async () => ({",
+            '  "chat.provider.failure": (input, output) => {',
+            '    if (input.failure !== "protocol_empty") return',
+            '    output.action = "fallback"',
+            '    output.models.push({ providerID: "fallback", modelID: "fallback-model" })',
+            "  },",
+            "})",
+          ].join("\n"),
+        )
+        const { llm } = yield* useServerConfig((url) => ({
+          ...routedProviderCfg(url),
+          plugin: [pathToFileURL(plugin).href],
+        }))
+        const events = yield* EventV2Bridge.Service
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: name })
+        const statuses: string[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+          const data = event.data as typeof SessionStatus.Event.Status.data.Type
+          if (data.sessionID === chat.id) statuses.push(data.status.type)
+          return Effect.void
+        })
+        yield* llm.push(first(), reply().text("fallback reply").stop())
+
+        const result = yield* awaitWithTimeout(
+          prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "route" }] }),
+          `timed out routing ${name}`,
+          "10 seconds",
+        )
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        yield* off
+        const users = messages.filter((message) => message.info.role === "user")
+        const assistants = messages.filter(
+          (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+            message.info.role === "assistant",
+        )
+        const failed = assistants.filter((message) => message.info.routedHandoff?.failure === "protocol_empty")
+        const successor = assistants.filter((message) => Boolean(message.info.routedHandoffID))
+
+        expect(users).toHaveLength(1)
+        expect(assistants).toHaveLength(2)
+        expect(failed).toHaveLength(1)
+        expect(failed[0]?.parts.filter((part) => part.type === "text").every((part) => part.text.trim() === "")).toBe(
+          true,
+        )
+        expect(successor).toHaveLength(1)
+        expect(result.info.id).toBe(successor[0]?.info.id)
+        expect(successor[0]?.info.parentID).toBe(users[0]?.info.id)
+        expect(successor[0]?.info.routedHandoffID).toBe(failed[0]?.info.routedHandoff?.id)
+        expect(failed[0]?.info.finish).toBe("error")
+        expect(failed[0]?.info.error).toBeDefined()
+        expect(failed[0]?.info.routedHandoff?.userMessageID).toBe(users[0]?.info.id)
+        expect(successor[0]?.info.variant).toBeUndefined()
+        expect(users[0]?.info).toMatchObject({
+          model: { providerID: "fallback", modelID: "fallback-model" },
+          routedHandoff: {
+            id: failed[0]?.info.routedHandoff?.id,
+            status: "applied",
+            userMessageID: users[0]?.info.id,
+          },
+        })
+        expect((yield* sessions.get(chat.id)).model?.variant).toBeUndefined()
+        expect(statuses.at(-1)).toBe("idle")
+        expect(statuses.slice(0, -1)).not.toContain("idle")
+        expect(yield* llm.hits).toHaveLength(2)
+      }),
+    { config: () => routedCfg },
+    20_000,
+  )
+}
+
+it.instance(
+  "stops a handled empty response with a stable redacted diagnostic",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "protocol-empty-stop.ts")
+      yield* writeText(
+        plugin,
+        'export default async () => ({ "chat.provider.failure": (input, output) => { if (input.failure === "protocol_empty") output.action = "stop" } })',
+      )
+      const { llm } = yield* useServerConfig((url) => ({
+        ...routedProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Empty stop" })
+      yield* llm.push(reply().stop())
+
+      yield* prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "route" }] })
+      const assistants = (yield* sessions.messages({ sessionID: chat.id })).filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } => message.info.role === "assistant",
+      )
+      expect(assistants).toHaveLength(1)
+      expect(JSON.stringify(assistants[0]?.info.error)).toContain("Routed empty-response failure: routing stopped")
+      expect(JSON.stringify(assistants[0]?.info.error)).not.toContain("test-key")
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
+  { config: () => routedCfg },
+  10_000,
+)
+
+it.instance(
+  "stops when the empty-response hook throws without native continuation",
+  () =>
+    Effect.gen(function* () {
+      const plugin = yield* Plugin.Service
+      const original = plugin.triggerProviderFailure
+      ;(plugin as { triggerProviderFailure: typeof plugin.triggerProviderFailure }).triggerProviderFailure = (() =>
+        Effect.fail("provider failure hook exploded")) as Plugin.Interface["triggerProviderFailure"]
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          ;(plugin as { triggerProviderFailure: typeof plugin.triggerProviderFailure }).triggerProviderFailure =
+            original
+        }),
+      )
+      const { llm } = yield* useServerConfig(routedProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Empty hook throw" })
+      yield* llm.push(reply().stop(), reply().text("must not run").stop())
+
+      yield* prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "route" }] })
+
+      const assistants = (yield* sessions.messages({ sessionID: chat.id })).filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } => message.info.role === "assistant",
+      )
+      expect(assistants).toHaveLength(1)
+      expect(JSON.stringify(assistants[0]?.info.error)).toContain("Routed empty-response failure: routing stopped")
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
+  { config: () => routedCfg },
+  10_000,
+)
+
+it.instance(
+  "keeps an unhandled empty response native and unmarked",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Unhandled empty" })
+      yield* llm.push(reply().stop())
+
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        parts: [{ type: "text", text: "native" }],
+      })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.error).toBeUndefined()
+        expect(result.info.routedHandoff).toBeUndefined()
+      }
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
+  { config: () => routedCfg },
+  10_000,
+)
+
+for (const [name, models] of [
+  ["same model", [{ providerID: "test", modelID: "test-model" }]],
+  [
+    "duplicate models",
+    [
+      { providerID: "fallback", modelID: "fallback-model" },
+      { providerID: "fallback", modelID: "fallback-model" },
+    ],
+  ],
+  ["empty models", []],
+  ["unknown provider", [{ providerID: "missing", modelID: "fallback-model" }]],
+  ["unknown model", [{ providerID: "fallback", modelID: "missing-model" }]],
+  ["invalid variant", [{ providerID: "fallback", modelID: "fallback-model", variant: "missing" }]],
+] as const) {
+  it.instance(
+    `stops an empty response on ${name} fallback proposal`,
+    () =>
+      Effect.gen(function* () {
+        const { directory } = yield* TestInstance
+        const plugin = path.join(directory, "protocol-empty-invalid.ts")
+        yield* writeText(
+          plugin,
+          `export default async () => ({ "chat.provider.failure": (input, output) => { if (input.failure === "protocol_empty") { output.action = "fallback"; output.models.push(...${JSON.stringify(models)}) } } })`,
+        )
+        const { llm } = yield* useServerConfig((url) => ({
+          ...routedProviderCfg(url),
+          plugin: [pathToFileURL(plugin).href],
+        }))
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: name })
+        yield* llm.push(reply().stop(), reply().text("must not run").stop())
+
+        yield* prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "route" }] })
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        const assistants = messages.filter(
+          (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+            message.info.role === "assistant",
+        )
+        expect(assistants).toHaveLength(1)
+        expect(JSON.stringify(assistants[0]?.info.error)).toContain(
+          "Routed empty-response failure: invalid fallback proposal",
+        )
+        expect(messages.filter((message) => message.info.routedHandoff)).toHaveLength(0)
+        expect(yield* llm.hits).toHaveLength(1)
+      }),
+    { config: () => routedCfg },
+    10_000,
+  )
+}
+
+it.instance(
+  "does not route non-empty terminal text",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "protocol-empty-observer.ts")
+      const invoked = path.join(directory, "protocol-empty-hook")
+      yield* writeText(
+        plugin,
+        `export default async () => ({ "chat.provider.failure": async (input) => { if (input.failure === "protocol_empty") await Bun.write(${JSON.stringify(invoked)}, "called") } })`,
+      )
+      const { llm } = yield* useServerConfig((url) => ({
+        ...routedProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Non-empty" })
+      yield* llm.text("visible")
+
+      yield* prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "text" }] })
+      expect(yield* Effect.promise(() => Bun.file(invoked).exists())).toBe(false)
+      expect((yield* sessions.messages({ sessionID: chat.id })).every((message) => !message.info.routedHandoff)).toBe(
+        true,
+      )
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
+  { config: () => routedCfg },
+  10_000,
+)
+
+it.instance(
+  "does not route valid structured output",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "protocol-empty-structured.ts")
+      const counter = path.join(directory, "protocol-empty-structured-count")
+      yield* writeText(counter, "0")
+      yield* writeText(plugin, protocolEmptyCounterPlugin(counter))
+      const { llm } = yield* useServerConfig((url) => ({
+        ...routedProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Structured output" })
+      yield* llm.push(reply().tool("StructuredOutput", { answer: "structured" }).stop())
+
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        parts: [{ type: "text", text: "return structured data" }],
+        format: new SessionV1.OutputFormatJsonSchema({
+          type: "json_schema",
+          schema: {
+            type: "object",
+            properties: { answer: { type: "string" } },
+            required: ["answer"],
+          },
+          retryCount: 0,
+        }),
+      })
+
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.structured).toEqual({ answer: "structured" })
+        expect(result.info.error).toBeUndefined()
+      }
+      expect(yield* protocolEmptyInvocationCount(counter)).toBe(0)
+      expect(yield* llm.hits).toHaveLength(1)
+    }),
+  { config: () => routedCfg },
+  10_000,
+)
+
+it.instance(
+  "does not route a user-consumable file attachment",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "protocol-empty-attachment.ts")
+      const counter = path.join(directory, "protocol-empty-attachment-count")
+      yield* writeText(counter, "0")
+      yield* writeText(plugin, protocolEmptyCounterPlugin(counter))
+      const { llm } = yield* useServerConfig((url) => ({
+        ...routedProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Attachment response" })
+      const gate = defer<void>()
+      const attachment = path.join(directory, "attachment.png")
+      yield* Effect.promise(() =>
+        Bun.write(attachment, Bun.file(path.join(import.meta.dir, "../tool/fixtures/large-image.png"))),
+      )
+      yield* llm.push(reply().tool("read", { filePath: attachment }).stop())
+      yield* llm.hold("The attachment is available.", gate.promise)
+
+      const run = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "read the image" }] })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(2), "timed out waiting for attachment continuation", "10 seconds")
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const tool = messages
+        .flatMap((message) => message.parts)
+        .find(
+          (part): part is CompletedToolPart =>
+            part.type === "tool" &&
+            part.tool === "read" &&
+            part.state.status === "completed" &&
+            Boolean(
+              part.state.attachments?.some(
+                (attachment) => attachment.type === "file" && attachment.url.startsWith("data:"),
+              ),
+            ),
+        )
+
+      expect(tool).toBeDefined()
+      expect(yield* protocolEmptyInvocationCount(counter)).toBe(0)
+      gate.resolve()
+      const result = yield* awaitWithTimeout(
+        Fiber.join(run),
+        "timed out waiting for attachment final response",
+        "10 seconds",
+      )
+      expect(result.parts.some((part) => part.type === "text" && part.text.trim().length > 0)).toBe(true)
+      expect(yield* protocolEmptyInvocationCount(counter)).toBe(0)
+      expect(yield* llm.hits).toHaveLength(2)
+    }),
+  { config: () => routedCfg },
+  10_000,
+)
+
+unix(
+  "does not route a tool-only intermediate response before its final response",
+  () =>
+    Effect.gen(function* () {
+      const { directory: dir } = yield* TestInstance
+      const llm = yield* TestLLMServer
+      const plugin = path.join(dir, "protocol-empty-tool.ts")
+      const counter = path.join(dir, "protocol-empty-tool-count")
+      const sideEffect = path.join(dir, "protocol-empty-tool-side-effect")
+      const gate = defer<void>()
+      yield* writeText(counter, "0")
+      yield* writeText(plugin, protocolEmptyCounterPlugin(counter))
+      yield* writeConfig(dir, { ...routedProviderCfg(llm.url), plugin: [pathToFileURL(plugin).href] })
+      const config = yield* Config.Service
+      yield* config.invalidate()
+      yield* config.get()
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Tool continuation",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.tool("bash", {
+        command: `printf executed >> ${JSON.stringify(sideEffect)}`,
+        workdir: path.resolve(dir),
+      })
+      yield* llm.hold("final response", gate.promise)
+
+      const run = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "run the tool" }] })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(2), "timed out waiting for tool continuation", "10 seconds")
+      expect(yield* Effect.promise(() => Bun.file(sideEffect).text())).toBe("executed")
+      expect(yield* protocolEmptyInvocationCount(counter)).toBe(0)
+
+      gate.resolve()
+      const result = yield* awaitWithTimeout(Fiber.join(run), "timed out waiting for final response", "10 seconds")
+      expect(result.parts.some((part) => part.type === "text" && part.text.trim().length > 0)).toBe(true)
+      expect(yield* Effect.promise(() => Bun.file(sideEffect).text())).toBe("executed")
+      expect(yield* protocolEmptyInvocationCount(counter)).toBe(0)
+      expect(yield* llm.hits).toHaveLength(2)
+    }),
+  { config: () => routedCfg },
+  20_000,
+)
+
+it.instance(
+  "routes a live 429 to one tagged fallback successor",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "route-plugin.ts")
+      yield* writeText(
+        plugin,
+        [
+          "export default async () => ({",
+          '  "chat.provider.failure": (_input, output) => {',
+          '    output.action = "fallback"',
+          '    output.models.push({ providerID: "fallback", modelID: "fallback-model" })',
+          "  },",
+          "})",
+        ].join("\n"),
+      )
+      const { llm } = yield* useServerConfig((url) => ({
+        ...routedProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Live handoff" })
+      yield* llm.error(429, { error: "provider body must not leak" })
+      yield* llm.text("fallback reply")
+
+      const result = yield* awaitWithTimeout(
+        prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "route" }] }),
+        "timed out waiting for live routed handoff",
+        "5 seconds",
+      )
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const users = messages.filter((message) => message.info.role === "user")
+      const assistants = messages.filter((message) => message.info.role === "assistant")
+      const failed = assistants.filter((message) => message.info.routedHandoff)
+      const successor = assistants.filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+          message.info.role === "assistant" && Boolean(message.info.routedHandoffID),
+      )
+
+      expect(users).toHaveLength(1)
+      expect(failed).toHaveLength(1)
+      expect(successor).toHaveLength(1)
+      expect(successor[0]?.info.providerID).toBe(ProviderV2.ID.make("fallback"))
+      expect(result.info.id).toBe(successor[0]?.info.id)
+      expect(yield* llm.hits).toHaveLength(2)
+      expect(JSON.stringify(failed[0]?.info.routedHandoff)).not.toContain("provider body")
+    }),
+  10_000,
+)
+
+it.instance(
+  "chains applied handoffs with new IDs and stops exhaustion without native retry",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "chained-route-plugin.ts")
+      yield* writeText(
+        plugin,
+        [
+          "export default async () => {",
+          "  let failures = 0",
+          "  return {",
+          '    "chat.provider.failure": (input, output) => {',
+          '      if (input.failure !== "rate_limit") return',
+          "      failures++",
+          '      if (failures === 1) { output.action = "fallback"; output.models.push({ providerID: "fallback", modelID: "fallback-model" }) }',
+          '      if (failures === 2) { output.action = "fallback"; output.models.push({ providerID: "test", modelID: "test-model" }) }',
+          '      if (failures === 3) output.action = "stop"',
+          "    },",
+          "  }",
+          "}",
+        ].join("\n"),
+      )
+      const { llm } = yield* useServerConfig((url) => ({
+        ...routedProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Chained routed failures" })
+      yield* llm.error(429, { error: "first" })
+      yield* llm.error(429, { error: "second" })
+      yield* llm.error(429, { error: "third" })
+      yield* llm.error(429, { error: "must not retry" })
+
+      yield* prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "route" }] })
+
+      const assistants = (yield* sessions.messages({ sessionID: chat.id })).filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } => message.info.role === "assistant",
+      )
+      const handoffs = assistants.flatMap((message) => (message.info.routedHandoff ? [message.info.routedHandoff] : []))
+      const users = (yield* sessions.messages({ sessionID: chat.id })).filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.User } => message.info.role === "user",
+      )
+      expect(handoffs).toHaveLength(2)
+      expect(handoffs[0]?.id).not.toBe(handoffs[1]?.id)
+      expect(handoffs.map((handoff) => handoff.status)).toEqual(["applied", "applied"])
+      expect(users).toHaveLength(1)
+      expect(assistants.every((assistant) => assistant.info.parentID === users[0]?.info.id)).toBe(true)
+      expect(
+        assistants.map((assistant) => ({ providerID: assistant.info.providerID, modelID: assistant.info.modelID })),
+      ).toEqual([
+        { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+        { providerID: ProviderV2.ID.make("fallback"), modelID: ModelV2.ID.make("fallback-model") },
+        { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+      ])
+      expect(users[0]?.info.routedHandoff).toMatchObject({ id: handoffs[1]?.id, status: "applied" })
+      expect(JSON.stringify(assistants.at(-1)?.info.error)).toContain("Routed provider failure: routing stopped")
+      expect(yield* llm.hits).toHaveLength(3)
+    }),
+  10_000,
+)
+
+it.instance(
+  "recovers an assistant-only marker with the fallback model",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(routedProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Marker recovery" })
+      const seeded = yield* seedRoutedHandoff(chat.id, { userMarker: false })
+      yield* llm.hang
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for marker recovery", "2 seconds")
+      const user = yield* MessageV2.get({ sessionID: chat.id, messageID: seeded.user.id })
+      const hits = yield* llm.hits
+      expect(user.info.role).toBe("user")
+      if (user.info.role === "user") expect(user.info.model).toEqual(seeded.handoff.next)
+      expect(hits).toHaveLength(1)
+      expect(hits[0]?.body.model).toBe("fallback-model")
+      yield* Fiber.interrupt(fiber)
+    }),
+  10_000,
+)
+
+it.instance(
+  "routes a missing current model through the same user handoff",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "config-model-plugin.ts")
+      yield* writeText(
+        plugin,
+        [
+          "export default async () => ({",
+          '  "chat.provider.failure": (input, output) => {',
+          '    if (input.failure !== "config_model") return',
+          '    output.action = "fallback"',
+          '    output.models.push({ providerID: "fallback", modelID: "fallback-model", variant: "high" })',
+          "  },",
+          "})",
+        ].join("\n"),
+      )
+      const { llm } = yield* useServerConfig((url) => ({
+        ...routedProviderCfg(url),
+        provider: {
+          ...routedProviderCfg(url).provider,
+          fallback: {
+            ...routedProviderCfg(url).provider.fallback,
+            models: {
+              "fallback-model": {
+                ...cfg.provider.test.models["test-model"],
+                id: "fallback-model",
+                reasoning: true,
+                variants: { high: {} },
+              },
+            },
+          },
+        },
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Missing configured model" })
+      const current = yield* user(chat.id, "route missing model")
+      current.model = { providerID: ref.providerID, modelID: ModelV2.ID.make("missing-model") }
+      yield* sessions.updateMessage(current)
+      yield* sessions.setAgentModel({
+        sessionID: chat.id,
+        agent: current.agent,
+        model: { providerID: current.model.providerID, id: current.model.modelID, variant: "default" },
+        time: Date.now(),
+      })
+      yield* llm.text("fallback reply")
+
+      yield* prompt.loop({ sessionID: chat.id })
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const users = messages.filter((message) => message.info.role === "user")
+      const successors = messages.filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+          message.info.role === "assistant" && Boolean(message.info.routedHandoffID),
+      )
+      expect(users).toHaveLength(1)
+      expect(successors).toHaveLength(1)
+      expect(successors[0]?.info.providerID).toBe(ProviderV2.ID.make("fallback"))
+      expect(successors[0]?.info.variant).toBe("high")
+      expect((yield* llm.hits).every((hit) => hit.body.model !== "missing-model")).toBe(true)
+      expect(users[0]?.info.routedHandoff).toMatchObject({ failure: "config_model", status: "applied" })
+    }),
+  10_000,
+)
+
+it.instance(
+  "omits an absent config model fallback variant",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "config-model-no-variant-plugin.ts")
+      yield* writeText(
+        plugin,
+        'export default async () => ({ "chat.provider.failure": (input, output) => { if (input.failure === "config_model") { output.action = "fallback"; output.models.push({ providerID: "fallback", modelID: "fallback-model" }) } } })',
+      )
+      const { llm } = yield* useServerConfig((url) => ({
+        ...routedProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Missing configured model without variant" })
+      const current = yield* user(chat.id, "route missing model")
+      current.model = { providerID: ref.providerID, modelID: ModelV2.ID.make("missing-model") }
+      yield* sessions.updateMessage(current)
+      yield* llm.text("fallback reply")
+
+      yield* prompt.loop({ sessionID: chat.id })
+
+      const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: current.id })
+      expect(stored.info.role).toBe("user")
+      if (stored.info.role === "user") {
+        expect(stored.info.model).toEqual({
+          providerID: ProviderV2.ID.make("fallback"),
+          modelID: ModelV2.ID.make("fallback-model"),
+        })
+      }
+      expect((yield* sessions.get(chat.id)).model?.variant).toBeUndefined()
+    }),
+  10_000,
+)
+
+it.instance(
+  "stops an invalid config model fallback variant before persistence or provider work",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "invalid-config-model-variant-plugin.ts")
+      yield* writeText(
+        plugin,
+        'export default async () => ({ "chat.provider.failure": (input, output) => { if (input.failure === "config_model") { output.action = "fallback"; output.models.push({ providerID: "fallback", modelID: "fallback-model", variant: "missing" }) } } })',
+      )
+      const { llm } = yield* useServerConfig((url) => ({
+        ...routedProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Invalid configured fallback variant" })
+      const current = yield* user(chat.id, "missing")
+      current.model = { providerID: ref.providerID, modelID: ModelV2.ID.make("missing-model") }
+      yield* sessions.updateMessage(current)
+      const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID === chat.id && data.error) errors.push(data.error)
+        return Effect.void
+      })
+
+      yield* prompt.loop({ sessionID: chat.id })
+      yield* off
+
+      expect(errors).toContainEqual(
+        expect.objectContaining({ data: { message: "Routed config/model failure: invalid fallback proposal" } }),
+      )
+      const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: current.id })
+      expect(stored.info.role).toBe("user")
+      if (stored.info.role === "user") {
+        expect(stored.info.model).toEqual({ providerID: ref.providerID, modelID: ModelV2.ID.make("missing-model") })
+        expect(stored.info.routedHandoff).toBeUndefined()
+      }
+      expect(yield* llm.hits).toHaveLength(0)
+      expect(
+        (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "assistant"),
+      ).toHaveLength(0)
+    }),
+  10_000,
+)
+
+raceNoLLMServer.instance(
+  "stops when the config model hook throws without provider work",
+  () =>
+    Effect.gen(function* () {
+      processorModels.length = 0
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          processorModels.length = 0
+        }),
+      )
+      const plugin = yield* Plugin.Service
+      const original = plugin.triggerProviderFailure
+      ;(plugin as { triggerProviderFailure: typeof plugin.triggerProviderFailure }).triggerProviderFailure = (() =>
+        Effect.fail("provider failure hook exploded")) as Plugin.Interface["triggerProviderFailure"]
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          ;(plugin as { triggerProviderFailure: typeof plugin.triggerProviderFailure }).triggerProviderFailure =
+            original
+        }),
+      )
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Config hook throw" })
+      const current = yield* user(chat.id, "missing")
+      current.model = { providerID: ref.providerID, modelID: ModelV2.ID.make("missing-model") }
+      yield* sessions.updateMessage(current)
+      const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID === chat.id && data.error) errors.push(data.error)
+        return Effect.void
+      })
+
+      expect(Exit.isSuccess(yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit))).toBe(true)
+      yield* off
+
+      expect(errors).toContainEqual(
+        expect.objectContaining({ data: { message: "Routed config/model failure: routing stopped" } }),
+      )
+      expect(processorModels).toHaveLength(0)
+    }),
+  { config: () => routedNoHttpCfg },
+  10_000,
+)
+
+it.instance(
+  "keeps an unhandled missing model native and unmarked",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "unhandled-config-model-plugin.ts")
+      const invoked = path.join(directory, "config-model-hook-invoked")
+      yield* writeText(
+        plugin,
+        [
+          "export default async () => ({",
+          '  "chat.provider.failure": async (input) => {',
+          '    if (input.failure === "config_model") await Bun.write(' + JSON.stringify(invoked) + ', "invoked")',
+          "  },",
+          "})",
+        ].join("\n"),
+      )
+      const { llm: configured } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Unhandled missing model" })
+      const current = yield* user(chat.id, "missing")
+      current.model = { providerID: ref.providerID, modelID: ModelV2.ID.make("missing-model") }
+      yield* sessions.updateMessage(current)
+      const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID === chat.id && data.error) errors.push(data.error)
+        return Effect.void
+      })
+
+      const exit = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
+      yield* off
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(ProviderSvc.ModelNotFoundError.isInstance(Cause.squash(exit.cause))).toBe(true)
+      expect(yield* Effect.promise(() => Bun.file(invoked).exists())).toBe(true)
+      expect(errors).toContainEqual(
+        expect.objectContaining({
+          data: { message: expect.stringMatching(/^Model not found: test\/missing-model\./) },
+        }),
+      )
+      expect((yield* sessions.messages({ sessionID: chat.id })).every((message) => !message.info.routedHandoff)).toBe(
+        true,
+      )
+      expect(yield* configured.hits).toHaveLength(0)
+    }),
+  10_000,
+)
+
+it.instance(
+  "stops handled missing models without assistant or provider work",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "stop-config-model-plugin.ts")
+      yield* writeText(
+        plugin,
+        [
+          "export default async () => ({",
+          '  "chat.provider.failure": (input, output) => {',
+          '    if (input.failure !== "config_model") return',
+          '    output.action = input.model.modelID === "missing-stop" ? "stop" : "fallback"',
+          "  },",
+          "})",
+        ].join("\n"),
+      )
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), plugin: [pathToFileURL(plugin).href] }))
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.error) errors.push(data.error)
+        return Effect.void
+      })
+
+      for (const [modelID, diagnostic] of [
+        ["missing-stop", "Routed config/model failure: routing stopped"],
+        ["missing-exhausted", "Routed config/model failure: invalid fallback proposal"],
+      ]) {
+        const chat = yield* sessions.create({ title: modelID })
+        const current = yield* user(chat.id, "missing")
+        current.model = { providerID: ref.providerID, modelID: ModelV2.ID.make(modelID) }
+        yield* sessions.updateMessage(current)
+        const exit = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        expect(errors.at(-1)).toMatchObject({ data: { message: diagnostic } })
+        expect(JSON.stringify(errors.at(-1))).not.toContain("provider body")
+        expect(
+          (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "assistant"),
+        ).toHaveLength(0)
+      }
+      yield* off
+
+      expect(yield* llm.hits).toHaveLength(0)
+    }),
+  10_000,
+)
+
+it.instance(
+  "stops a missing fallback proposal before later candidates",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "invalid-config-model-plugin.ts")
+      yield* writeText(
+        plugin,
+        [
+          "export default async () => ({",
+          '  "chat.provider.failure": (input, output) => {',
+          '    if (input.failure !== "config_model") return',
+          '    output.action = "fallback"',
+          '    output.models.push({ providerID: "missing", modelID: "missing-model" })',
+          '    output.models.push({ providerID: "fallback", modelID: "fallback-model" })',
+          "  },",
+          "})",
+        ].join("\n"),
+      )
+      const { llm } = yield* useServerConfig((url) => ({
+        ...routedProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Invalid fallback proposal" })
+      const current = yield* user(chat.id, "missing")
+      current.model = { providerID: ref.providerID, modelID: ModelV2.ID.make("missing-model") }
+      yield* sessions.updateMessage(current)
+      const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID === chat.id && data.error) errors.push(data.error)
+        return Effect.void
+      })
+
+      yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
+      yield* off
+
+      expect(errors).toContainEqual(
+        expect.objectContaining({ data: { message: "Routed config/model failure: invalid fallback proposal" } }),
+      )
+      const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: current.id })
+      expect(stored.info.role).toBe("user")
+      if (stored.info.role === "user") {
+        expect(stored.info.model).toEqual({ providerID: ref.providerID, modelID: ModelV2.ID.make("missing-model") })
+        expect(stored.info.routedHandoff).toBeUndefined()
+      }
+      expect(yield* llm.hits).toHaveLength(0)
+    }),
+  10_000,
+)
+
+raceNoLLMServer.instance(
+  "selects the first ordered configured fallback with its variant",
+  () =>
+    Effect.gen(function* () {
+      processorCreateStarted.length = 0
+      processorModels.length = 0
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          processorCreateStarted.length = 0
+          processorModels.length = 0
+        }),
+      )
+
+      const plugin = yield* Plugin.Service
+      const original = plugin.triggerProviderFailure
+      ;(plugin as { triggerProviderFailure: typeof plugin.triggerProviderFailure }).triggerProviderFailure = () =>
+        Effect.succeed({
+          action: "fallback",
+          models: [
+            { providerID: "fallback", modelID: "fallback-model", variant: "high" },
+            { providerID: "fallback", modelID: "second-model" },
+          ],
+        })
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          ;(plugin as { triggerProviderFailure: typeof plugin.triggerProviderFailure }).triggerProviderFailure =
+            original
+        }),
+      )
+
+      yield* (yield* Config.Service).get()
+      const provider = yield* ProviderSvc.Service
+      expect(Object.keys((yield* provider.list())[ProviderV2.ID.make("fallback")]?.models ?? {})).toContain(
+        "fallback-model",
+      )
+      expect(
+        Exit.isSuccess(
+          yield* provider.getModel(ProviderV2.ID.make("fallback"), ModelV2.ID.make("fallback-model")).pipe(Effect.exit),
+        ),
+      ).toBe(true)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Ordered fallback" })
+      const current = yield* user(chat.id, "missing")
+      current.model = { providerID: ref.providerID, modelID: ModelV2.ID.make("missing-model") }
+      yield* sessions.updateMessage(current)
+      const successorCreated = defer<void>()
+      processorCreateStarted.push(successorCreated.resolve)
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Effect.promise(() => successorCreated.promise),
+        "timed out waiting for ordered fallback successor",
+        "2 seconds",
+      )
+
+      const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: current.id })
+      const session = yield* sessions.get(chat.id)
+      const successors = (yield* sessions.messages({ sessionID: chat.id })).filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+          message.info.role === "assistant" && Boolean(message.info.routedHandoffID),
+      )
+      expect(stored.info.role).toBe("user")
+      if (stored.info.role === "user") {
+        expect(stored.info.model).toEqual({
+          providerID: ProviderV2.ID.make("fallback"),
+          modelID: ModelV2.ID.make("fallback-model"),
+          variant: "high",
+        })
+      }
+      expect(session.model).toEqual({
+        providerID: ProviderV2.ID.make("fallback"),
+        id: ModelV2.ID.make("fallback-model"),
+        variant: "high",
+      })
+      expect(successors).toHaveLength(1)
+      expect(successors[0]?.info.variant).toBe("high")
+      expect(processorModels).toHaveLength(1)
+      expect(processorModels[0]).toMatchObject({
+        providerID: ProviderV2.ID.make("fallback"),
+        id: ModelV2.ID.make("fallback-model"),
+      })
+      yield* Fiber.interrupt(fiber)
+    }),
+  { config: () => routedNoHttpCfg },
+  10_000,
+)
+
+raceNoLLMServer.instance(
+  "recovers a config model user marker once without requesting its invalid source",
+  () =>
+    Effect.gen(function* () {
+      processorCreateStarted.length = 0
+      processorModels.length = 0
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          processorCreateStarted.length = 0
+          processorModels.length = 0
+        }),
+      )
+
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Config user marker recovery" })
+      const current = (yield* user(chat.id, "recover missing model")) as SessionV1.User
+      current.model = { providerID: ref.providerID, modelID: ModelV2.ID.make("missing-model") }
+      const handoff = {
+        ...routedHandoff(current.id),
+        failure: "config_model" as const,
+        from: current.model,
+      }
+      current.routedHandoff = handoff
+      yield* sessions.updateMessage(current)
+      const successorCreated = defer<void>()
+      processorCreateStarted.push(successorCreated.resolve)
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Effect.promise(() => successorCreated.promise),
+        "timed out waiting for config marker recovery",
+        "2 seconds",
+      )
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const successors = messages.filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+          message.info.role === "assistant" && message.info.routedHandoffID === handoff.id,
+      )
+      const recovered = yield* MessageV2.get({ sessionID: chat.id, messageID: current.id })
+      expect(successors).toHaveLength(1)
+      expect(recovered.info.role).toBe("user")
+      if (recovered.info.role === "user") expect(recovered.info.model).toEqual(handoff.next)
+      expect(successors[0]?.info.routedHandoff).toBeUndefined()
+      expect(processorModels).toHaveLength(1)
+      expect(processorModels[0]).toMatchObject({
+        providerID: ProviderV2.ID.make("fallback"),
+        id: ModelV2.ID.make("fallback-model"),
+      })
+      expect(processorModels.every((model) => model.id !== ModelV2.ID.make("missing-model"))).toBe(true)
+      yield* Fiber.interrupt(fiber)
+    }),
+  { config: () => routedProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "keeps unrelated model resolution defects terminal without invoking the hook",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "defect-config-model-plugin.ts")
+      const invoked = path.join(directory, "defect-config-model-hook-invoked")
+      yield* writeText(
+        plugin,
+        [
+          "export default async () => ({",
+          '  "chat.provider.failure": async () => {',
+          "    await Bun.write(" + JSON.stringify(invoked) + ', "invoked")',
+          "  },",
+          "})",
+        ].join("\n"),
+      )
+      const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), plugin: [pathToFileURL(plugin).href] }))
+      const provider = yield* ProviderSvc.Service
+      const original = provider.getModel
+      ;(provider as { getModel: typeof provider.getModel }).getModel = () =>
+        Effect.die(new Error("unrelated model resolution defect"))
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          ;(provider as { getModel: typeof provider.getModel }).getModel = original
+        }),
+      )
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Unrelated model resolution defect" })
+      yield* user(chat.id, "defect")
+
+      const exit = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(String(Cause.squash(exit.cause))).toContain("unrelated model resolution defect")
+      expect(yield* Effect.promise(() => Bun.file(invoked).exists())).toBe(false)
+      expect((yield* sessions.messages({ sessionID: chat.id })).every((message) => !message.info.routedHandoff)).toBe(
+        true,
+      )
+      expect(yield* llm.hits).toHaveLength(0)
+    }),
+  10_000,
+)
+
+it.instance(
+  "preserves native missing model behavior with no plugin",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Plugin absent missing model" })
+      const current = yield* user(chat.id, "missing")
+      current.model = { providerID: ref.providerID, modelID: ModelV2.ID.make("missing-model") }
+      yield* sessions.updateMessage(current)
+      const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID === chat.id && data.error) errors.push(data.error)
+        return Effect.void
+      })
+
+      const exit = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
+      yield* off
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(ProviderSvc.ModelNotFoundError.isInstance(Cause.squash(exit.cause))).toBe(true)
+      expect(errors).toEqual([
+        expect.objectContaining({
+          data: { message: expect.stringMatching(/^Model not found: test\/missing-model\./) },
+        }),
+      ])
+      expect((yield* sessions.messages({ sessionID: chat.id })).every((message) => !message.info.routedHandoff)).toBe(
+        true,
+      )
+      expect(yield* llm.hits).toHaveLength(0)
+    }),
+  10_000,
+)
+
+for (const [name, input, message] of [
+  ["pending and tagged", { status: "pending", tagged: true }, "routed handoff interrupted"],
+  [
+    "pending and tagged with stop finish",
+    { status: "pending", tagged: true, finish: "stop" },
+    "routed handoff interrupted",
+  ],
+  [
+    "pending and tagged with tool-calls finish",
+    { status: "pending", tagged: true, finish: "tool-calls" },
+    "routed handoff interrupted",
+  ],
+  [
+    "applied tagged tool-calls with open tail",
+    { status: "applied", tagged: true, finish: "tool-calls", tail: true },
+    "routed handoff interrupted",
+  ],
+  [
+    "applied terminal tagged with open tail",
+    { status: "applied", tagged: true, terminal: true, tail: true },
+    "routed handoff interrupted",
+  ],
+  ["applied and tagged nonterminal", { status: "applied", tagged: true }, "routed handoff interrupted"],
+  ["applied and tagged cancelled", { status: "applied", tagged: true, cancelled: true }, "MessageAbortedError"],
+  ["applied and missing successor", { status: "applied" }, "routed handoff invariant"],
+  [
+    "applied and mismatched successor",
+    { status: "applied", tagged: true, differentTagged: true },
+    "routed handoff invariant",
+  ],
+] as const) {
+  noLLMServer.instance(
+    `${name} stops without provider work`,
+    () =>
+      Effect.gen(function* () {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: name })
+        const seeded = yield* seedRoutedHandoff(chat.id, input)
+
+        yield* awaitWithTimeout(prompt.loop({ sessionID: chat.id }), `timed out stopping ${name}`, "500 millis")
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        const last = messages.findLast(
+          (item): item is SessionV1.WithParts & { info: SessionV1.Assistant } => item.info.role === "assistant",
+        )
+        expect(JSON.stringify(last?.info.error)).toContain(message)
+        expect(last?.info.time.completed).toBeDefined()
+        expect(seeded.handoff.status).toBe(input.status)
+      }),
+    { config: routedCfg },
+  )
+}
+
+noLLMServer.instance(
+  "applied terminal handoff exits without a replacement",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Applied terminal" })
+      yield* seedRoutedHandoff(chat.id, { status: "applied", tagged: true, terminal: true })
+
+      const result = yield* awaitWithTimeout(
+        prompt.loop({ sessionID: chat.id }),
+        "timed out exiting applied terminal",
+        "500 millis",
+      )
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.finish).toBe("stop")
+      expect(messages.filter((message) => message.info.role === "assistant")).toHaveLength(2)
+    }),
+  { config: routedCfg },
+)
+
+noLLMServer.instance(
+  "pending tagged terminal handoff exits without marking it interrupted",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pending terminal" })
+      const seeded = yield* seedRoutedHandoff(chat.id, { tagged: true, terminal: true })
+
+      const result = yield* awaitWithTimeout(
+        prompt.loop({ sessionID: chat.id }),
+        "timed out exiting pending terminal",
+        "500 millis",
+      )
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const user = messages.find(
+        (message): message is SessionV1.WithParts & { info: SessionV1.User } => message.info.role === "user",
+      )
+      const failed = messages.find(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+          message.info.role === "assistant" && message.info.routedHandoff?.id === seeded.handoff.id,
+      )
+      const successor = messages.find(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+          message.info.role === "assistant" && message.info.routedHandoffID === seeded.handoff.id,
+      )
+      if (!user || !failed || !successor) return yield* Effect.die("missing pending terminal handoff messages")
+      expect(result.info.id).toBe(successor.info.id)
+      expect(successor.info.error).toBeUndefined()
+      expect(successor.info.finish).toBe("stop")
+      expect(user.info.routedHandoff).toMatchObject({ id: seeded.handoff.id, status: "applied" })
+      expect(failed.info.routedHandoff).toMatchObject({ id: seeded.handoff.id, status: "applied" })
+      expect(messages.filter((message) => message.info.role === "assistant")).toHaveLength(2)
+    }),
+  { config: routedCfg },
+)
+
+it.instance(
+  "authoritative applied handoff suppresses stale markers across work units",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(routedProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Stale handoff" })
+      const seeded = yield* seedRoutedHandoff(chat.id, { status: "applied" })
+      seeded.assistant.routedHandoff = { ...seeded.handoff, status: "pending" }
+      yield* sessions.updateMessage(seeded.assistant)
+
+      yield* awaitWithTimeout(prompt.loop({ sessionID: chat.id }), "timed out stopping stale handoff", "500 millis")
+      expect(yield* llm.calls).toBe(0)
+
+      yield* llm.text("new work")
+      yield* user(chat.id, "later work unit")
+      yield* prompt.loop({ sessionID: chat.id })
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(1)
+      expect(messages.filter((message) => message.info.role === "assistant")).toHaveLength(2)
+    }),
+  10_000,
+)
+
+it.instance(
+  "pending handoff bypasses over-budget pre-process compaction",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(routedProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pending overflow" })
+      const seeded = yield* seedRoutedHandoff(chat.id)
+      seeded.assistant.tokens = { ...seeded.assistant.tokens, input: 200_000 }
+      yield* sessions.updateMessage(seeded.assistant)
+      yield* llm.text("fallback reply")
+
+      yield* prompt.loop({ sessionID: chat.id })
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(yield* llm.calls).toBe(1)
+      expect(
+        messages.filter(
+          (message) => message.info.role === "assistant" && message.info.routedHandoffID === seeded.handoff.id,
+        ),
+      ).toHaveLength(1)
+      expect(messages.flatMap((message) => message.parts).some((part) => part.type === "compaction")).toBe(false)
+    }),
+  10_000,
+)
+
+for (const [site, candidates, selected, minContextTokens, variant] of [
+  [
+    "pre-process",
+    [{ providerID: "fallback", modelID: "fallback-large", variant: "high" }],
+    "fallback-large",
+    101,
+    "high",
+  ],
+  [
+    "post-process",
+    [{ providerID: "fallback", modelID: "fallback-large", variant: "high" }],
+    "fallback-large",
+    101,
+    "high",
+  ],
+  [
+    "pre-process",
+    [
+      { providerID: "fallback", modelID: "fallback-bound" },
+      { providerID: "fallback", modelID: "fallback-large", variant: "high" },
+    ],
+    "fallback-large",
+    101,
+    "high",
+  ],
+  [
+    "post-process",
+    [
+      { providerID: "fallback", modelID: "fallback-bound" },
+      { providerID: "fallback", modelID: "fallback-large", variant: "high" },
+    ],
+    "fallback-large",
+    101,
+    "high",
+  ],
+  ["pre-process", [{ providerID: "fallback", modelID: "fallback-large" }], "fallback-large", 101, undefined],
+  ["post-process", [{ providerID: "fallback", modelID: "fallback-large" }], "fallback-large", 101, undefined],
+] as const) {
+  overflowHarness.instance(
+    `${site} overflow selects the ${candidates.length === 1 ? "first" : "second"} capable fallback${variant ? " with an explicit variant" : " without a variant"} without compaction`,
+    () =>
+      Effect.gen(function* () {
+        const { directory } = yield* TestInstance
+        const plugin = path.join(directory, `${site}-overflow-plugin.ts`)
+        const capture = path.join(directory, `${site}-overflow-input.json`)
+        yield* writeText(plugin, overflowPlugin({ capture, action: "fallback", models: candidates }))
+        const { llm } = yield* useServerConfig((url) => ({
+          ...overflowProviderCfg(url),
+          plugin: [pathToFileURL(plugin).href],
+        }))
+        const events = yield* EventV2Bridge.Service
+        const statuses: string[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+          statuses.push((event.data as typeof SessionStatus.Event.Status.data.Type).status.type)
+          return Effect.void
+        })
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: `${site} overflow fallback` })
+        if (site === "pre-process") {
+          const seeded = yield* seed(chat.id, { finish: "tool-calls" })
+          seeded.assistant.tokens = { ...seeded.assistant.tokens, input: minContextTokens }
+          yield* sessions.updateMessage(seeded.assistant)
+          yield* llm.text("fallback", { usage: { input: 1, output: 1 } })
+          yield* prompt.loop({ sessionID: chat.id })
+        } else {
+          yield* llm.push(
+            reply().text("overflow").usage({ input: minContextTokens, output: 0 }).stop(),
+            reply().text("fallback").usage({ input: 1, output: 1 }).stop(),
+          )
+          yield* prompt.prompt({
+            sessionID: chat.id,
+            agent: "build",
+            parts: [{ type: "text", text: "PROMPT-MUST-NOT-LEAK" }],
+          })
+        }
+        yield* off
+
+        const input = yield* Effect.promise(() => Bun.file(capture).json())
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        const users = messages.filter((message) => message.info.role === "user")
+        const successors = messages.filter(
+          (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+            message.info.role === "assistant" && Boolean(message.info.routedHandoffID),
+        )
+        expect(input).toMatchObject({ failure: "overflow" })
+        expect(JSON.stringify(input)).not.toContain("test-key")
+        expect(JSON.stringify(input)).not.toContain("PROMPT-MUST-NOT-LEAK")
+        expect(overflowCompactions(chat.id)).toHaveLength(0)
+        expect(users).toHaveLength(1)
+        expect(successors).toHaveLength(1)
+        expect(successors[0]?.info.parentID).toBe(users[0]?.info.id)
+        expect(successors[0]?.info.modelID).toBe(ModelV2.ID.make(selected))
+        expect(successors[0]?.info.variant).toBe(variant)
+        expect(users[0]?.info.routedHandoff?.next).toEqual({
+          providerID: ProviderV2.ID.make("fallback"),
+          modelID: ModelV2.ID.make(selected),
+          ...(variant ? { variant } : {}),
+        })
+        expect((yield* sessions.get(chat.id)).model?.variant).toBe(variant)
+        if (site === "post-process") {
+          const completed = messages.find(
+            (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+              message.info.role === "assistant" && message.info.routedHandoffID === undefined,
+          )
+          expect(completed?.info.finish).toBe("stop")
+          expect(completed?.info.error).toBeUndefined()
+          expect(completed?.info.routedHandoff).toBeUndefined()
+          expect(completed?.parts).toContainEqual(expect.objectContaining({ type: "text", text: "overflow" }))
+          expect(JSON.stringify((yield* llm.hits)[1]?.body.messages)).toContain("overflow")
+        }
+        expect(statuses.slice(0, -1)).not.toContain("idle")
+      }),
+    { config: () => overflowProviderCfg("http://localhost:1/v1") },
+    10_000,
+  )
+}
+
+overflowHarness.instance(
+  "post-process provider overflow marks the failed assistant and omits it from the fallback transcript",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "post-process-provider-overflow-plugin.ts")
+      const capture = path.join(directory, "post-process-provider-overflow-input.json")
+      yield* writeText(
+        plugin,
+        overflowPlugin({
+          capture,
+          action: "fallback",
+          models: [{ providerID: "fallback", modelID: "fallback-large" }],
+        }),
+      )
+      const { llm } = yield* useServerConfig((url) => ({
+        ...overflowProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Post-process provider overflow" })
+      yield* llm.error(413, { error: { message: "request entity too large" } })
+      yield* llm.text("fallback")
+
+      yield* prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "provider overflow" }] })
+
+      const assistants = (yield* sessions.messages({ sessionID: chat.id })).filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } => message.info.role === "assistant",
+      )
+      const failed = assistants.find((message) => message.info.routedHandoff?.failure === "overflow")
+      expect(overflowCompactions(chat.id)).toHaveLength(0)
+      const input = yield* Effect.promise(() => Bun.file(capture).json())
+      expect(input).toMatchObject({ failure: "overflow" })
+      expect(failed?.info.finish).toBe("error")
+      expect(failed?.info.error).toBeDefined()
+      expect(failed?.parts.some((part) => part.type === "text")).toBe(false)
+      expect(failed?.info.routedHandoff).toMatchObject({ status: "applied", failure: "overflow" })
+      expect(
+        assistants.filter((message) => message.info.routedHandoffID === failed?.info.routedHandoff?.id),
+      ).toHaveLength(1)
+      expect((yield* sessions.get(chat.id)).model?.variant).toBeUndefined()
+      expect(
+        ((yield* llm.hits)[1]?.body.messages as Array<{ role: string }>).filter(
+          (message) => message.role === "assistant",
+        ),
+      ).toHaveLength(0)
+    }),
+  { config: () => overflowProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+overflowHarness.instance(
+  "provider overflow rejects a candidate at the current usable bound and compacts once",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "provider-overflow-bound-plugin.ts")
+      yield* writeText(
+        plugin,
+        overflowPlugin({
+          capture: path.join(directory, "provider-overflow-bound-input.json"),
+          action: "fallback",
+          models: [{ providerID: "fallback", modelID: "fallback-bound" }],
+        }),
+      )
+      const { llm } = yield* useServerConfig((url) => ({
+        ...overflowProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Provider overflow bound" })
+      yield* llm.error(413, { error: { message: "request entity too large" } })
+
+      yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "provider overflow" }] })
+        .pipe(Effect.exit)
+
+      expect(overflowCompactions(chat.id)).toHaveLength(1)
+      expect(overflowCompactions(chat.id)[0]?.overflow).toBe(true)
+      const failed = (yield* sessions.messages({ sessionID: chat.id })).find(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } => message.info.role === "assistant",
+      )
+      expect(failed?.info.finish).toBe("error")
+      expect(failed?.info.error).toBeDefined()
+    }),
+  { config: () => overflowProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+overflowHarness.instance(
+  "provider overflow with unavailable usable lower bound compacts instead of routing with a zero minimum",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "unavailable-estimate-overflow-plugin.ts")
+      yield* writeText(
+        plugin,
+        overflowPlugin({
+          capture: path.join(directory, "unavailable-estimate-overflow-input.json"),
+          action: "fallback",
+          models: [{ providerID: "fallback", modelID: "fallback-large" }],
+        }),
+      )
+      yield* useServerConfig((url) => ({
+        ...overflowProviderCfg(url),
+        provider: {
+          ...overflowProviderCfg(url).provider,
+          test: {
+            ...overflowProviderCfg(url).provider.test,
+            models: {
+              "test-model": {
+                ...overflowProviderCfg(url).provider.test.models["test-model"],
+                limit: { context: 0, output: 20 },
+              },
+            },
+          },
+        },
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Unavailable request estimate" })
+      const seeded = yield* seed(chat.id, { finish: "tool-calls" })
+      seeded.assistant.tokens = { ...seeded.assistant.tokens, input: 100 }
+      yield* sessions.updateMessage(seeded.assistant)
+
+      yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
+
+      expect(overflowCompactions(chat.id)).toHaveLength(1)
+      expect(overflowCompactions(chat.id)[0]?.overflow).toBe(false)
+      expect((yield* sessions.messages({ sessionID: chat.id })).every((message) => !message.info.routedHandoff)).toBe(
+        true,
+      )
+    }),
+  { config: () => overflowProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+cappedOverflowHarness.instance(
+  "provider overflow active output cap rejects the bound candidate and selects the larger fallback",
+  () =>
+    Effect.gen(function* () {
+      const { directory } = yield* TestInstance
+      const plugin = path.join(directory, "capped-provider-overflow-plugin.ts")
+      const capture = path.join(directory, "capped-provider-overflow-input.json")
+      yield* writeText(
+        plugin,
+        overflowPlugin({
+          capture,
+          action: "fallback",
+          models: [
+            { providerID: "fallback", modelID: "fallback-bound" },
+            { providerID: "fallback", modelID: "fallback-large" },
+          ],
+        }),
+      )
+      const { llm } = yield* useServerConfig((url) => ({
+        ...overflowProviderCfg(url),
+        plugin: [pathToFileURL(plugin).href],
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Capped provider overflow" })
+      yield* llm.error(413, { error: { message: "request entity too large" } })
+      yield* llm.text("fallback")
+
+      yield* prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "provider overflow" }] })
+
+      const successors = (yield* sessions.messages({ sessionID: chat.id })).filter(
+        (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+          message.info.role === "assistant" && Boolean(message.info.routedHandoffID),
+      )
+      const input = yield* Effect.promise(() => Bun.file(capture).json())
+      expect(input).toMatchObject({ failure: "overflow" })
+      expect(overflowCompactions(chat.id)).toHaveLength(0)
+      expect(successors).toHaveLength(1)
+      expect(successors[0]?.info.modelID).toBe(ModelV2.ID.make("fallback-large"))
+    }),
+  { config: () => overflowProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+overflowHarness.instance(
+  "pre-process overflow stops when the provider failure hook throws",
+  () =>
+    Effect.gen(function* () {
+      const plugin = yield* Plugin.Service
+      const original = plugin.triggerProviderFailure
+      ;(plugin as { triggerProviderFailure: typeof plugin.triggerProviderFailure }).triggerProviderFailure = (input) =>
+        input.failure === "overflow" ? Effect.fail("provider failure hook exploded") : original(input)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          ;(plugin as { triggerProviderFailure: typeof plugin.triggerProviderFailure }).triggerProviderFailure =
+            original
+        }),
+      )
+      const events = yield* EventV2Bridge.Service
+      const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Overflow hook throw" })
+      const off = yield* events.listen((event) => {
+        if (event.type !== Session.Event.Error.type) return Effect.void
+        const data = event.data as typeof Session.Event.Error.data.Type
+        if (data.sessionID === chat.id && data.error) errors.push(data.error)
+        return Effect.void
+      })
+      const seeded = yield* seed(chat.id, { finish: "tool-calls" })
+      seeded.assistant.tokens = { ...seeded.assistant.tokens, input: 101 }
+      yield* sessions.updateMessage(seeded.assistant)
+
+      yield* prompt.loop({ sessionID: chat.id })
+      yield* off
+
+      expect(errors).toContainEqual(
+        expect.objectContaining({ data: { message: "Routed overflow failure: routing stopped" } }),
+      )
+      expect(overflowCompactions(chat.id)).toHaveLength(0)
+    }),
+  { config: () => overflowProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+for (const [site, kind, action, models, expectedCompactions] of [
+  ["pre-process", "all incapable", "fallback", [{ providerID: "fallback", modelID: "fallback-small" }], 1],
+  ["post-process", "all incapable", "fallback", [{ providerID: "fallback", modelID: "fallback-small" }], 1],
+  ["pre-process", "unhandled", undefined, undefined, 1],
+  ["post-process", "unhandled", undefined, undefined, 1],
+  ["pre-process", "handled stop", "stop", [], 0],
+  ["post-process", "handled stop", "stop", [], 0],
+  ["pre-process", "no candidates", "fallback", [], 1],
+  ["post-process", "no candidates", "fallback", [], 1],
+] as const) {
+  overflowHarness.instance(
+    `${site} overflow ${kind} ${
+      expectedCompactions === 1 ? "creates native compaction once" : "stops without compaction"
+    }`,
+    () =>
+      Effect.gen(function* () {
+        const { directory } = yield* TestInstance
+        const plugin = path.join(directory, `${site}-native-overflow-plugin.ts`)
+        const capture = path.join(directory, `${site}-native-overflow-input.json`)
+        if (action) {
+          yield* writeText(plugin, overflowPlugin({ capture, action, models }))
+        }
+        yield* writeConfig(directory, {
+          ...overflowProviderCfg((yield* TestLLMServer).url),
+          ...(action ? { plugin: [pathToFileURL(plugin).href] } : {}),
+        })
+        const service = yield* Config.Service
+        yield* service.invalidate()
+        yield* service.get()
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: `${site} native overflow` })
+        const events = yield* EventV2Bridge.Service
+        const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type !== Session.Event.Error.type) return Effect.void
+          const data = event.data as typeof Session.Event.Error.data.Type
+          if (data.sessionID === chat.id && data.error) errors.push(data.error)
+          return Effect.void
+        })
+        if (site === "pre-process") {
+          const seeded = yield* seed(chat.id, { finish: "tool-calls" })
+          seeded.assistant.tokens = { ...seeded.assistant.tokens, input: 100 }
+          yield* sessions.updateMessage(seeded.assistant)
+          yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
+        } else {
+          const llm = yield* TestLLMServer
+          yield* llm.push(reply().text("overflow").usage({ input: 100, output: 0 }).stop())
+          yield* prompt
+            .prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "native" }] })
+            .pipe(Effect.exit)
+        }
+        yield* off
+        expect(overflowCompactions(chat.id)).toHaveLength(expectedCompactions)
+        if (expectedCompactions) expect(overflowCompactions(chat.id)[0]?.overflow).toBe(false)
+        if (action) expect(yield* Effect.promise(() => Bun.file(capture).exists())).toBe(true)
+        if (kind === "handled stop") {
+          expect(errors).toContainEqual(
+            expect.objectContaining({ data: { message: "Routed overflow failure: routing stopped" } }),
+          )
+          expect(JSON.stringify(errors)).not.toContain("test-key")
+          if (site === "post-process") {
+            const failed = (yield* sessions.messages({ sessionID: chat.id })).find(
+              (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+                message.info.role === "assistant",
+            )
+            expect(failed?.info.error).toMatchObject({ data: { message: "Routed overflow failure: routing stopped" } })
+          }
+        }
+      }),
+    { config: () => overflowProviderCfg("http://localhost:1/v1") },
+    10_000,
+  )
+}
+
+for (const [site, models] of [
+  ["pre-process", [{ providerID: "test", modelID: "test-model" }]],
+  ["post-process", [{ providerID: "test", modelID: "test-model" }]],
+  [
+    "pre-process",
+    [
+      { providerID: "fallback", modelID: "fallback-large" },
+      { providerID: "fallback", modelID: "fallback-large" },
+    ],
+  ],
+  [
+    "post-process",
+    [
+      { providerID: "fallback", modelID: "fallback-large" },
+      { providerID: "fallback", modelID: "fallback-large" },
+    ],
+  ],
+  ["pre-process", [{ providerID: "missing", modelID: "missing" }]],
+  ["post-process", [{ providerID: "missing", modelID: "missing" }]],
+  ["pre-process", [{ providerID: "fallback", modelID: "fallback-large", variant: "missing" }]],
+  ["post-process", [{ providerID: "fallback", modelID: "fallback-large", variant: "missing" }]],
+] as const) {
+  overflowHarness.instance(
+    `${site} overflow invalid proposal stops without compaction`,
+    () =>
+      Effect.gen(function* () {
+        const { directory } = yield* TestInstance
+        const plugin = path.join(directory, `${site}-invalid-overflow-plugin.ts`)
+        const capture = path.join(directory, `${site}-invalid-overflow-input.json`)
+        yield* writeText(plugin, overflowPlugin({ capture, action: "fallback", models }))
+        const { llm } = yield* useServerConfig((url) => ({
+          ...overflowProviderCfg(url),
+          plugin: [pathToFileURL(plugin).href],
+        }))
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: `${site} invalid overflow` })
+        if (site === "pre-process") {
+          const seeded = yield* seed(chat.id, { finish: "tool-calls" })
+          seeded.assistant.tokens = { ...seeded.assistant.tokens, input: 100 }
+          yield* sessions.updateMessage(seeded.assistant)
+          yield* prompt.loop({ sessionID: chat.id })
+        } else {
+          yield* llm.push(reply().text("overflow").usage({ input: 100, output: 0 }).stop())
+          yield* prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "invalid" }] })
+        }
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        expect(yield* Effect.promise(() => Bun.file(capture).exists())).toBe(true)
+        expect(overflowCompactions(chat.id)).toHaveLength(0)
+        expect(messages.filter((message) => message.info.routedHandoff)).toHaveLength(0)
+        if (site === "post-process") {
+          const completed = messages.find(
+            (message): message is SessionV1.WithParts & { info: SessionV1.Assistant } =>
+              message.info.role === "assistant",
+          )
+          expect(completed?.info.finish).toBe("stop")
+          expect(completed?.info.error).toBeUndefined()
+          expect(completed?.parts).toContainEqual(expect.objectContaining({ type: "text", text: "overflow" }))
+        }
+      }),
+    { config: () => overflowProviderCfg("http://localhost:1/v1") },
+    10_000,
+  )
+}
+
+it.instance(
+  "pending handoff defers a queued subtask until its tagged successor finishes once",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(routedProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pending subtask" })
+      const seeded = yield* seedRoutedHandoff(chat.id)
+      yield* addSubtask(chat.id, seeded.user.id)
+      yield* llm.tool("glob", { pattern: "*" })
+      yield* llm.text("fallback completed")
+      yield* llm.text("subtask reply")
+
+      yield* prompt.loop({ sessionID: chat.id })
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const tagged = messages.filter(
+        (message) => message.info.role === "assistant" && message.info.routedHandoffID === seeded.handoff.id,
+      )
+      const subtasks = messages.filter(
+        (message) => message.info.role === "assistant" && message.info.agent === "general",
+      )
+      expect(yield* llm.calls).toBe(3)
+      expect(tagged).toHaveLength(1)
+      expect(subtasks).toHaveLength(1)
+      expect(messages.indexOf(tagged[0]!)).toBeLessThan(messages.indexOf(subtasks[0]!))
+    }),
+  10_000,
+)
+
+for (const [name, userMarker] of [
+  ["processor marker before user apply", false],
+  ["user pending before successor create", true],
+] as const) {
+  noLLMServer.instance(
+    `cancel clears ${name} without recovery activity`,
+    () =>
+      Effect.gen(function* () {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: `Cancel ${name}` })
+        const seeded = yield* seedRoutedHandoff(chat.id, { userMarker })
+
+        yield* prompt.cancel(chat.id)
+
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        expect(messages.filter((message) => message.info.routedHandoff?.status === "pending")).toHaveLength(0)
+        expect(
+          messages.filter(
+            (message) => message.info.role === "assistant" && message.info.routedHandoffID === seeded.handoff.id,
+          ),
+        ).toHaveLength(0)
+        expect(messages.filter((message) => message.info.role === "assistant")).toHaveLength(1)
+      }),
+    { config: routedCfg },
+  )
+}
 
 it.instance("loop exits without an LLM request for interrupted orphan tool calls", () =>
   Effect.gen(function* () {

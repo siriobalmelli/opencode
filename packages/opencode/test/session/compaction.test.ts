@@ -203,7 +203,9 @@ function fake(
       return msg
     },
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
+    startToolCall: Effect.fn("TestSessionProcessor.startToolCall")(() => Effect.void),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
+    failToolCall: Effect.fn("TestSessionProcessor.failToolCall")(() => Effect.void),
     process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
   } satisfies SessionProcessorModule.SessionProcessor.Handle
 }
@@ -348,6 +350,7 @@ function plugin(ready: Deferred.Deferred<void>) {
     },
     list: () => Effect.succeed([]),
     init: () => Effect.void,
+    triggerProviderFailure: () => Effect.succeed({ action: "unhandled", models: [] }),
   })
 }
 
@@ -362,6 +365,7 @@ function autocontinue(enabled: boolean) {
     },
     list: () => Effect.succeed([]),
     init: () => Effect.void,
+    triggerProviderFailure: () => Effect.succeed({ action: "unhandled", models: [] }),
   })
 }
 

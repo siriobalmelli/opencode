@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Option, Scope, Schema, Semaphore } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -25,9 +25,46 @@ import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import type { ModelTuple, ProviderFailure } from "@opencode-ai/plugin"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { validateFallbackCandidates } from "./routing"
 
 const DOOM_LOOP_THRESHOLD = 3
-export type Result = "compact" | "stop" | "continue"
+const JOIN_TOOLS_TIMEOUT = "5 seconds"
+export type RoutedHandoff = {
+  type: "handoff"
+  handoffID: string
+  failure: ProviderFailure
+  candidates: ModelTuple[]
+  next: ModelTuple
+}
+export type Result = "compact" | "stop" | "continue" | RoutedHandoff
+
+export function classifyProviderFailure(error: unknown): ProviderFailure | undefined {
+  if (!error) return undefined
+  if (SessionV1.AuthError.isInstance(error)) return "auth"
+  if (SessionV1.ContextOverflowError.isInstance(error)) return "overflow"
+  if (!SessionV1.APIError.isInstance(error)) return undefined
+
+  const statusCode = error.data.statusCode
+  if (statusCode === 401 || statusCode === 403) return "auth"
+  if (statusCode === 429) return "rate_limit"
+  if (statusCode !== undefined && statusCode >= 500) return "server"
+  if (error.data.isRetryable) return "network"
+  return undefined
+}
+
+function retryAfterMs(error: SessionV1.APIError) {
+  const headers = error.data.responseHeaders
+  const milliseconds = Number(headers?.["retry-after-ms"])
+  if (Number.isFinite(milliseconds) && milliseconds >= 0) return milliseconds
+  const seconds = Number(headers?.["retry-after"])
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000
+  const date = Date.parse(headers?.["retry-after"] ?? "")
+  if (!Number.isNaN(date) && date > Date.now()) return date - Date.now()
+  return undefined
+}
 
 export interface Handle {
   readonly message: SessionV1.Assistant
@@ -35,6 +72,7 @@ export interface Handle {
     toolCallID: string,
     update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
   ) => Effect.Effect<SessionV1.ToolPart | undefined>
+  readonly startToolCall: (toolCallID: string) => Effect.Effect<void>
   readonly completeToolCall: (
     toolCallID: string,
     output: {
@@ -44,6 +82,7 @@ export interface Handle {
       attachments?: SessionV1.FilePart[]
     },
   ) => Effect.Effect<void>
+  readonly failToolCall: (toolCallID: string, error: unknown, interrupted?: boolean) => Effect.Effect<void>
   readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
 }
 
@@ -51,6 +90,8 @@ type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
+  provider?: Provider.Interface
+  joinToolsTimeout?: Duration.Input
 }
 
 export interface Interface {
@@ -62,6 +103,8 @@ type ToolCall = {
   messageID: SessionV1.ToolPart["messageID"]
   sessionID: SessionV1.ToolPart["sessionID"]
   done: Deferred.Deferred<void>
+  lock: Semaphore.Semaphore
+  owner: "client" | "provider"
 }
 
 interface ProcessorContext extends Input {
@@ -70,6 +113,7 @@ interface ProcessorContext extends Input {
   snapshot: string | undefined
   blocked: boolean
   needsCompaction: boolean
+  routing: boolean
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
 }
@@ -109,6 +153,7 @@ const layer = Layer.effect(
         snapshot: initialSnapshot,
         blocked: false,
         needsCompaction: false,
+        routing: false,
         currentText: undefined,
         reasoningMap: {},
       }
@@ -120,11 +165,12 @@ const layer = Layer.effect(
           aborted,
         })
 
-      const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
-        const done = ctx.toolcalls[toolCallID]?.done
-        delete ctx.toolcalls[toolCallID]
-        if (done) yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
-      })
+      const releaseToolCall = (toolCallID: string) =>
+        Effect.gen(function* () {
+          const done = ctx.toolcalls[toolCallID]?.done
+          delete ctx.toolcalls[toolCallID]
+          if (done) yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
+        }).pipe(Effect.uninterruptible)
 
       const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
         const call = ctx.toolcalls[toolCallID]
@@ -135,7 +181,7 @@ const layer = Layer.effect(
           sessionID: call.sessionID,
         })
         if (!part || part.type !== "tool") {
-          delete ctx.toolcalls[toolCallID]
+          yield* releaseToolCall(toolCallID)
           return undefined
         }
         return { call, part }
@@ -145,16 +191,32 @@ const layer = Layer.effect(
         toolCallID: string,
         update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
       ) {
-        const match = yield* readToolCall(toolCallID)
-        if (!match) return undefined
-        const part = yield* session.updatePart(update(match.part))
-        ctx.toolcalls[toolCallID] = {
-          ...match.call,
-          partID: part.id,
-          messageID: part.messageID,
-          sessionID: part.sessionID,
-        }
-        return part
+        const call = ctx.toolcalls[toolCallID]
+        if (!call) return undefined
+        return yield* call.lock.withPermit(
+          Effect.gen(function* () {
+            if (ctx.toolcalls[toolCallID] !== call) return undefined
+            const match = yield* readToolCall(toolCallID)
+            if (!match || ctx.toolcalls[toolCallID] !== call) return undefined
+            if (!["pending", "running"].includes(match.part.state.status)) {
+              yield* releaseToolCall(toolCallID)
+              return undefined
+            }
+            const part = yield* Effect.sync(() => update(match.part)).pipe(Effect.flatMap(session.updatePart))
+            Object.assign(call, {
+              partID: part.id,
+              messageID: part.messageID,
+              sessionID: part.sessionID,
+            })
+            return part
+          }),
+        )
+      })
+
+      const startToolCall = Effect.fn("SessionProcessor.startToolCall")(function* (toolCallID: string) {
+        const call = ctx.toolcalls[toolCallID]
+        if (!call) return yield* Effect.die(`Missing tool registration: ${toolCallID}`)
+        call.owner = "client"
       })
 
       const completeToolCall = Effect.fn("SessionProcessor.completeToolCall")(function* (
@@ -166,42 +228,85 @@ const layer = Layer.effect(
           attachments?: SessionV1.FilePart[]
         },
       ) {
-        const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return
-        yield* session.updatePart({
-          ...match.part,
-          state: {
-            status: "completed",
-            input: match.part.state.input,
-            output: output.output,
-            metadata: output.metadata,
-            title: output.title,
-            time: { start: match.part.state.time.start, end: Date.now() },
-            attachments: output.attachments,
-          },
-        })
-        yield* settleToolCall(toolCallID)
+        const call = ctx.toolcalls[toolCallID]
+        if (!call) return
+        yield* call.lock.withPermit(
+          Effect.gen(function* () {
+            if (ctx.toolcalls[toolCallID] !== call) return
+            const match = yield* readToolCall(toolCallID)
+            if (!match || ctx.toolcalls[toolCallID] !== call) return
+            if (!["pending", "running"].includes(match.part.state.status)) return yield* releaseToolCall(toolCallID)
+            const start = match.part.state.status === "running" ? match.part.state.time.start : Date.now()
+            const normalized = yield* Effect.forEach(output.attachments ?? [], (attachment) =>
+              attachment.mime.startsWith("image/")
+                ? image.normalize(attachment).pipe(
+                    Effect.catchIf(
+                      (error) => error instanceof Image.ResizerUnavailableError,
+                      () => Effect.succeed(attachment),
+                    ),
+                    Effect.exit,
+                  )
+                : Effect.succeed(Exit.succeed<SessionV1.FilePart>(attachment)),
+            )
+            const omitted = normalized.filter(Exit.isFailure).length
+            const attachments = normalized.filter(Exit.isSuccess).map((item) => item.value)
+            yield* session.updatePart({
+              ...match.part,
+              state: {
+                status: "completed",
+                input: match.part.state.input,
+                output:
+                  omitted === 0
+                    ? output.output
+                    : `${output.output}\n\n[${omitted} image${omitted === 1 ? "" : "s"} omitted: could not be resized below the image size limit.]`,
+                metadata: output.metadata,
+                title: output.title,
+                time: { start, end: Date.now() },
+                attachments: attachments.length ? attachments : undefined,
+              },
+            })
+          }).pipe(Effect.ensuring(releaseToolCall(toolCallID))),
+        )
       })
 
-      const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
-        const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return false
-        yield* session.updatePart({
-          ...match.part,
-          state: {
-            status: "error",
-            input: match.part.state.input,
-            error: errorMessage(error),
-            // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
-            metadata: match.part.state.metadata,
-            time: { start: match.part.state.time.start, end: Date.now() },
-          },
-        })
+      const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (
+        toolCallID: string,
+        error: unknown,
+        interrupted = false,
+      ) {
         if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
           ctx.blocked = ctx.shouldBreak
         }
-        yield* settleToolCall(toolCallID)
-        return true
+        const call = ctx.toolcalls[toolCallID]
+        if (!call) return false
+        return yield* call.lock.withPermit(
+          Effect.gen(function* () {
+            if (ctx.toolcalls[toolCallID] !== call) return false
+            const match = yield* readToolCall(toolCallID)
+            if (!match || ctx.toolcalls[toolCallID] !== call) return false
+            if (!["pending", "running"].includes(match.part.state.status)) {
+              yield* releaseToolCall(toolCallID)
+              return false
+            }
+            const start = match.part.state.status === "running" ? match.part.state.time.start : Date.now()
+            const metadata =
+              "metadata" in match.part.state && isRecord(match.part.state.metadata)
+                ? match.part.state.metadata
+                : undefined
+            yield* session.updatePart({
+              ...match.part,
+              state: {
+                status: "error",
+                input: match.part.state.input,
+                error: errorMessage(error),
+                // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
+                metadata: interrupted ? { ...metadata, interrupted: true } : metadata,
+                time: { start, end: Date.now() },
+              },
+            })
+            return true
+          }).pipe(Effect.ensuring(releaseToolCall(toolCallID))),
+        )
       })
 
       const finishReasoning = Effect.fn("SessionProcessor.finishReasoning")(function* (reasoningID: string) {
@@ -225,12 +330,11 @@ const layer = Layer.effect(
             ...existing.part,
             metadata: { ...existing.part.metadata, providerExecuted: true },
           })
-          ctx.toolcalls[input.id] = {
-            ...existing.call,
+          Object.assign(existing.call, {
             partID: part.id,
             messageID: part.messageID,
             sessionID: part.sessionID,
-          }
+          })
           return { call: ctx.toolcalls[input.id], part }
         }
         const part = yield* session.updatePart({
@@ -245,6 +349,8 @@ const layer = Layer.effect(
         } satisfies SessionV1.ToolPart)
         ctx.toolcalls[input.id] = {
           done: yield* Deferred.make<void>(),
+          lock: Semaphore.makeUnsafe(1),
+          owner: "provider",
           partID: part.id,
           messageID: part.messageID,
           sessionID: part.sessionID,
@@ -388,28 +494,7 @@ const layer = Layer.effect(
               return
             }
             const rawOutput = toolResultOutput(value)
-            const normalized = yield* Effect.forEach(rawOutput.attachments ?? [], (attachment) =>
-              attachment.mime.startsWith("image/")
-                ? image.normalize(attachment).pipe(
-                    Effect.catchIf(
-                      (error) => error instanceof Image.ResizerUnavailableError,
-                      () => Effect.succeed(attachment),
-                    ),
-                    Effect.exit,
-                  )
-                : Effect.succeed(Exit.succeed<SessionV1.FilePart>(attachment)),
-            )
-            const omitted = normalized.filter(Exit.isFailure).length
-            const attachments = normalized.filter(Exit.isSuccess).map((item) => item.value)
-            const output = {
-              ...rawOutput,
-              output:
-                omitted === 0
-                  ? rawOutput.output
-                  : `${rawOutput.output}\n\n[${omitted} image${omitted === 1 ? "" : "s"} omitted: could not be resized below the image size limit.]`,
-              attachments: attachments.length ? attachments : undefined,
-            }
-            yield* completeToolCall(value.id, output)
+            yield* completeToolCall(value.id, rawOutput)
             return
           }
 
@@ -569,28 +654,39 @@ const layer = Layer.effect(
         ctx.reasoningMap = {}
 
         yield* Effect.forEach(
-          Object.values(ctx.toolcalls),
+          Object.values(ctx.toolcalls).filter((call) => call.owner === "client"),
           (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
           { concurrency: "unbounded" },
         )
 
-        for (const toolCallID of Object.keys(ctx.toolcalls)) {
-          const match = yield* readToolCall(toolCallID)
-          if (!match) continue
-          const part = match.part
-          const end = Date.now()
-          const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
-          yield* session.updatePart({
-            ...part,
-            state: {
-              ...part.state,
-              status: "error",
-              error: "Tool execution aborted",
-              metadata: { ...metadata, interrupted: true },
-              time: { start: "time" in part.state ? part.state.time.start : end, end },
-            },
-          })
-        }
+        yield* Effect.forEach(
+          Object.keys(ctx.toolcalls),
+          (toolCallID) => {
+            const call = ctx.toolcalls[toolCallID]
+            if (!call) return Effect.void
+            return call.lock.withPermit(
+              Effect.gen(function* () {
+                if (ctx.toolcalls[toolCallID] !== call) return
+                const match = yield* readToolCall(toolCallID)
+                if (!match || ctx.toolcalls[toolCallID] !== call) return
+                const part = match.part
+                const end = Date.now()
+                const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
+                yield* session.updatePart({
+                  ...part,
+                  state: {
+                    ...part.state,
+                    status: "error",
+                    error: "Tool execution aborted",
+                    metadata: { ...metadata, interrupted: true },
+                    time: { start: "time" in part.state ? part.state.time.start : end, end },
+                  },
+                })
+              }).pipe(Effect.ensuring(releaseToolCall(toolCallID)), Effect.ignore),
+            )
+          },
+          { concurrency: "unbounded" },
+        )
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
         yield* session.updateMessage(ctx.assistantMessage)
@@ -624,6 +720,128 @@ const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
+      const tools = Effect.fn("SessionProcessor.tools")(function* () {
+        const summary = { pending: 0, running: 0, interrupted: 0, errored: 0, completed: 0 }
+        const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
+          Effect.provideService(Database.Service, database),
+        )
+        for (const part of parts) {
+          if (part.type !== "tool") continue
+          if (part.state.status === "pending") summary.pending++
+          if (part.state.status === "running") summary.running++
+          if (part.state.status === "completed") summary.completed++
+          if (part.state.status === "error") {
+            if (part.state.metadata?.interrupted === true) summary.interrupted++
+            else summary.errored++
+          }
+        }
+        return summary
+      })
+
+      const joinTools = Effect.fn("SessionProcessor.joinTools")(function* () {
+        const exit = yield* Effect.forEach(
+          Object.values(ctx.toolcalls).filter((call) => call.owner === "client"),
+          (call) => Deferred.await(call.done),
+          {
+            concurrency: "unbounded",
+          },
+        ).pipe(Effect.timeout(input.joinToolsTimeout ?? JOIN_TOOLS_TIMEOUT), Effect.exit)
+        return Exit.isSuccess(exit)
+      })
+
+      const routedStop = Effect.fn("SessionProcessor.routedStop")(function* (message: string) {
+        yield* halt(new Error(message))
+        return "stop" as const
+      })
+
+      const routeFailure = Effect.fn("SessionProcessor.routeFailure")(function* (
+        error: unknown,
+        streamInput: LLM.StreamInput,
+      ) {
+        const parsed = parse(error)
+        // MessageV2.fromError can discard typed shape from serialized errors.
+        // Raw classification is therefore required as a fallback.
+        const failure = classifyProviderFailure(parsed) ?? classifyProviderFailure(error)
+        if (!failure || failure === "unknown" || failure === "overflow") return undefined
+        const retry = SessionV1.APIError.isInstance(parsed) ? retryAfterMs(parsed) : undefined
+        const decision = yield* plugin
+          .triggerProviderFailure({
+            sessionID: ctx.sessionID,
+            userMessageID: streamInput.user.id,
+            agent: ctx.assistantMessage.agent,
+            model: {
+              providerID: ctx.model.providerID,
+              modelID: ctx.model.id,
+              ...(ctx.assistantMessage.variant ? { variant: ctx.assistantMessage.variant } : {}),
+            },
+            failure,
+            ...(SessionV1.APIError.isInstance(parsed) && parsed.data.statusCode !== undefined
+              ? { statusCode: parsed.data.statusCode }
+              : {}),
+            ...(retry === undefined ? {} : { retryAfterMs: retry }),
+            observedTools: yield* tools(),
+          })
+          .pipe(Effect.catch(() => Effect.succeed({ action: "stop", models: [] })))
+        if (decision.action === "unhandled") return undefined
+        if (decision.action === "stop") return yield* routedStop("Routed provider failure: routing stopped")
+
+        ctx.assistantMessage.error = parsed
+        ctx.assistantMessage.finish = "error"
+        ctx.routing = true
+        const joined = yield* joinTools()
+        ctx.routing = false
+        const settled = yield* tools()
+        if (!joined || settled.pending || settled.running || settled.interrupted || settled.errored) {
+          return yield* routedStop("Routed provider failure: tool state is indeterminate")
+        }
+        const candidates = validateFallbackCandidates(
+          {
+            providerID: ctx.model.providerID,
+            modelID: ctx.model.id,
+            ...(ctx.assistantMessage.variant ? { variant: ctx.assistantMessage.variant } : {}),
+          },
+          decision.models,
+        )
+        if (!candidates) return yield* routedStop("Routed provider failure: invalid fallback proposal")
+        const provider = input.provider
+        if (!provider) return yield* routedStop("Routed provider failure: invalid fallback proposal")
+
+        const resolved = yield* Effect.forEach(candidates, (candidate) =>
+          provider
+            .getModel(ProviderV2.ID.make(candidate.providerID), ModelV2.ID.make(candidate.modelID))
+            .pipe(Effect.option),
+        )
+        if (
+          resolved.some(
+            (model, index) =>
+              Option.isNone(model) ||
+              (!!candidates[index]?.variant && !model.value.variants?.[candidates[index].variant!]),
+          )
+        ) {
+          return yield* routedStop("Routed provider failure: invalid fallback proposal")
+        }
+
+        const handoffID = `handoff_${PartID.ascending()}`
+        const next = candidates[0]
+        ctx.assistantMessage.routedHandoff = {
+          id: handoffID,
+          status: "pending",
+          failure,
+          from: {
+            providerID: ctx.model.providerID,
+            modelID: ctx.model.id,
+            ...(ctx.assistantMessage.variant ? { variant: ctx.assistantMessage.variant } : {}),
+          },
+          next: {
+            providerID: ProviderV2.ID.make(next.providerID),
+            modelID: ModelV2.ID.make(next.modelID),
+            ...(next.variant ? { variant: next.variant } : {}),
+          },
+          userMessageID: streamInput.user.id,
+        }
+        return { type: "handoff", handoffID, failure, candidates, next } satisfies RoutedHandoff
+      })
+
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
@@ -633,7 +851,7 @@ const layer = Layer.effect(
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
         return yield* Effect.gen(function* () {
-          yield* Effect.gen(function* () {
+          const result = yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
@@ -645,17 +863,14 @@ const layer = Layer.effect(
               Stream.runDrain,
             )
           }).pipe(
-            Effect.onInterrupt(() =>
-              Effect.gen(function* () {
-                aborted = true
-                if (!ctx.assistantMessage.error) {
-                  yield* halt(new DOMException("Aborted", "AbortError"))
-                }
-              }),
-            ),
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) => Effect.fail(Cause.squash(cause)),
+            ),
+            Effect.catch((error) =>
+              routeFailure(error, streamInput).pipe(
+                Effect.flatMap((result) => (result ? Effect.succeed(result) : Effect.fail(error))),
+              ),
             ),
             Effect.retry(
               SessionRetry.policy({
@@ -673,9 +888,24 @@ const layer = Layer.effect(
               }),
             ),
             Effect.catch(halt),
+            Effect.onInterrupt(() =>
+              Effect.gen(function* () {
+                aborted = true
+                ctx.assistantMessage.routedHandoff = undefined
+                if (ctx.routing) {
+                  ctx.assistantMessage.error = undefined
+                  ctx.assistantMessage.finish = "error"
+                  yield* halt(new DOMException("Aborted", "AbortError"))
+                } else if (!ctx.assistantMessage.error) {
+                  ctx.assistantMessage.finish = "error"
+                  yield* halt(new DOMException("Aborted", "AbortError"))
+                }
+              }),
+            ),
             Effect.ensuring(cleanup()),
           )
 
+          if (typeof result === "object") return result
           if (ctx.needsCompaction) return "compact"
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"
@@ -687,7 +917,10 @@ const layer = Layer.effect(
           return ctx.assistantMessage
         },
         updateToolCall,
+        startToolCall,
         completeToolCall,
+        failToolCall: (toolCallID, error, interrupted) =>
+          failToolCall(toolCallID, error, interrupted).pipe(Effect.asVoid),
         process,
       } satisfies Handle
     })

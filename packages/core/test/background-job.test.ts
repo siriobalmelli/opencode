@@ -86,6 +86,48 @@ describe("BackgroundJob", () => {
     }).pipe(Effect.provide(jobsLayer)),
   )
 
+  it.live("invokes settlement callbacks once after all extensions complete", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const first = yield* Deferred.make<void>()
+      const second = yield* Deferred.make<void>()
+      const settled = yield* Deferred.make<BackgroundJob.Info>()
+      let callbacks = 0
+      const job = yield* jobs.start({
+        type: "test",
+        onSettled: (info) =>
+          Effect.sync(() => {
+            callbacks += 1
+          }).pipe(Effect.andThen(Deferred.succeed(settled, info)), Effect.asVoid),
+        run: Deferred.await(first).pipe(Effect.as("first")),
+      })
+
+      expect(yield* jobs.extend({ id: job.id, run: Deferred.await(second).pipe(Effect.as("second")) })).toBe(true)
+      yield* Deferred.succeed(first, undefined)
+      expect((yield* jobs.get(job.id))?.status).toBe("running")
+      expect(callbacks).toBe(0)
+
+      yield* Deferred.succeed(second, undefined)
+      expect(yield* Deferred.await(settled)).toMatchObject({ status: "completed", output: "second" })
+      expect(callbacks).toBe(1)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("invokes settlement callbacks for cancellation", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const settled = yield* Deferred.make<BackgroundJob.Info>()
+      const job = yield* jobs.start({
+        type: "test",
+        onSettled: (info) => Deferred.succeed(settled, info).pipe(Effect.asVoid),
+        run: Effect.never,
+      })
+
+      yield* jobs.cancel(job.id)
+      expect(yield* Deferred.await(settled)).toMatchObject({ status: "cancelled" })
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
   it.live("interrupts live work without promising settlement after the owning process-local scope closes", () =>
     Effect.gen(function* () {
       const scope = yield* Scope.make()
